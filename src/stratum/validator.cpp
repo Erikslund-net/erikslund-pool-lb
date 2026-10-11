@@ -60,12 +60,23 @@ struct RequestEnvelope {
     std::optional<glz::raw_json_view> params;
     std::optional<glz::raw_json_view> result;
     std::optional<glz::raw_json_view> error;
+    bool duplicate_field = false;
+
+    template <auto Member>
+    void read_field(glz::raw_json_view value) {
+        auto& field = this->*Member;
+        duplicate_field |= field.has_value();
+        field = value;
+    }
 
     struct glaze {
         using T = RequestEnvelope;
         static constexpr auto value =
-            glz::object("id", &T::id, "method", &T::method, "params", &T::params, "result",
-                        &T::result, "error", &T::error);
+            glz::object("id", glz::custom<&T::read_field<&T::id>, &T::id>,
+                        "method", glz::custom<&T::read_field<&T::method>, &T::method>,
+                        "params", glz::custom<&T::read_field<&T::params>, &T::params>,
+                        "result", glz::custom<&T::read_field<&T::result>, &T::result>,
+                        "error", glz::custom<&T::read_field<&T::error>, &T::error>);
     };
 };
 
@@ -87,30 +98,43 @@ struct DecodedString {
     std::string_view value;
 };
 
-bool within_depth(std::string_view text, int maximum_depth) {
+ValidationError validate_structure(std::string_view text, int maximum_depth) {
     int depth = 0;
     bool in_string = false;
     bool escaped = false;
+    bool expecting_key = false;
+    bool envelope_key = false;
     for (const char character : text) {
         if (in_string) {
             if (escaped)
                 escaped = false;
-            else if (character == '\\')
+            else if (character == '\\') {
+                // Glaze's fixed-field dispatch matches literal keys. Reject escaped envelope
+                // keys so a backend that decodes them cannot see a different RPC method/id.
+                if (envelope_key)
+                    return ValidationError::InvalidShape;
                 escaped = true;
-            else if (character == '"')
+            } else if (character == '"')
                 in_string = false;
             continue;
         }
         if (character == '"') {
             in_string = true;
+            envelope_key = depth == 1 && expecting_key;
         } else if (character == '{' || character == '[') {
             if (++depth > maximum_depth)
-                return false;
+                return ValidationError::TooDeep;
+            if (depth == 1)
+                expecting_key = true;
         } else if ((character == '}' || character == ']') && depth > 0) {
             --depth;
+        } else if (depth == 1 && character == ',') {
+            expecting_key = true;
+        } else if (depth == 1 && character == ':') {
+            expecting_key = false;
         }
     }
-    return true;
+    return ValidationError::None;
 }
 
 std::string_view trim_json_whitespace(std::string_view value) {
@@ -339,8 +363,9 @@ ValidationResult validate_request(std::string_view line, const ProtocolState& st
         line.remove_suffix(1);
     if (line.empty())
         return reject(ValidationError::Empty);
-    if (!within_depth(line, config.max_json_depth))
-        return reject(ValidationError::TooDeep);
+    if (const auto error = validate_structure(line, config.max_json_depth);
+        error != ValidationError::None)
+        return reject(error);
 
     const std::string_view trimmed = trim_json_whitespace(line);
     if (trimmed.empty())
@@ -355,6 +380,8 @@ ValidationResult validate_request(std::string_view line, const ProtocolState& st
     RequestEnvelope envelope;
     if (glz::read<kEnvelopeReadOptions>(envelope, line))
         return reject(ValidationError::InvalidJson);
+    if (envelope.duplicate_field)
+        return reject(ValidationError::InvalidShape);
     if (!envelope.method) {
         if (!state.received_message)
             return reject(ValidationError::InvalidShape);

@@ -21,14 +21,16 @@ struct RuntimeSnapshot {
 struct ServiceState {
     void publish(std::shared_ptr<const Config> config,
                  std::shared_ptr<const routing::RoutingTable> routing) {
-        const std::uint64_t replacement_queue_limit = config->limits.max_queued_bytes;
-        auto replacement = std::make_shared<const RuntimeSnapshot>(
-            RuntimeSnapshot{.config = std::move(config), .routing = std::move(routing)});
+        publish(std::make_shared<const RuntimeSnapshot>(
+            RuntimeSnapshot{.config = std::move(config), .routing = std::move(routing)}));
+    }
+
+    void publish(std::shared_ptr<const RuntimeSnapshot> replacement) noexcept {
         // Publish process-wide ceilings before the snapshot that makes the replacement runtime
         // visible. Existing sessions deliberately retain their routing snapshot, but must obey
         // current process memory limits. Construct first so allocation failure cannot partially
         // apply a reload.
-        stats.queued_bytes_limit.store(replacement_queue_limit,
+        stats.queued_bytes_limit.store(replacement->config->limits.max_queued_bytes,
                                        std::memory_order_relaxed);
         runtime.store(std::move(replacement), std::memory_order_release);
     }

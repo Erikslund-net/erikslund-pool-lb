@@ -10,6 +10,7 @@ cd "$(dirname "$0")/.."
 
 COMPOSE=(docker compose -f tests/e2e/docker-compose.yml)
 FAILURES=0
+RESULT_DIR="${E2E_RESULT_DIR:-}"
 
 # Distinguishes the three outcomes that matter. A scenario that never ran must never be reported as
 # a share-loss result, and an impairment the kernel refused must never be reported as a pass.
@@ -36,6 +37,13 @@ run_scenario() {
 }
 
 cleanup() {
+  if [[ -n "$RESULT_DIR" ]]; then
+    mkdir -p "$RESULT_DIR"
+    "${COMPOSE[@]}" logs --no-color --no-log-prefix >"$RESULT_DIR/services.log" 2>&1 || true
+    "${COMPOSE[@]}" config >"$RESULT_DIR/compose.yml" 2>&1 || true
+    curl -fsS --max-time 5 http://127.0.0.1:17778/metrics \
+      >"$RESULT_DIR/metrics.prom" 2>"$RESULT_DIR/metrics-error.log" || true
+  fi
   "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -63,10 +71,18 @@ for scenario in "${SCENARIOS[@]}"; do
     run_scenario "$name" "${COMPOSE[@]}" run --rm --no-deps tester-impaired share-integrity || true
 done
 
-echo "==> Reconnect storm: a whole site returning after a switch reboot"
-run_scenario reconnect-storm "${COMPOSE[@]}" run --rm --no-deps \
-  -e E2E_SCENARIO=reconnect-storm -e E2E_MINERS=64 -e E2E_SUBMITS=4 \
-  -e E2E_TIMEOUT_SECONDS=20 tester share-integrity || true
+for transport in plain tls; do
+  echo "==> Simultaneous ${transport} reconnect storm after a site switch reboot"
+  if [[ "$transport" == tls ]]; then
+    transport_environment=(-e LB_TLS=1 -e LB_PORT=3334)
+  else
+    transport_environment=(-e LB_TLS=0 -e LB_PORT=3333)
+  fi
+  run_scenario "reconnect-storm-${transport}" "${COMPOSE[@]}" run --rm --no-deps \
+    "${transport_environment[@]}" -e E2E_SCENARIO="reconnect-storm-${transport}" \
+    -e E2E_CONCURRENT=1 -e E2E_MINERS=64 -e E2E_SUBMITS=4 \
+    -e E2E_TIMEOUT_SECONDS=20 tester share-integrity || true
+done
 
 echo "==> Edge counters"
 metrics=$(curl -fsS --max-time 5 http://127.0.0.1:17778/metrics)

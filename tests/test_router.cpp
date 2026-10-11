@@ -81,6 +81,9 @@ TEST_CASE("routing reload replaces a backend whose address now resolves elsewher
     const auto original_backend = first->pools[0].backends[0];
     original_backend->healthy.store(true);
     original_backend->active_connections.store(4);
+    original_backend->metrics->active_connections.store(4);
+    original_backend->metrics->connection_attempts.store(25);
+    original_backend->metrics->connection_errors.store(2);
     // Stands in for a hostname that moved since the last resolution: the configured text is
     // unchanged, but the address behind it is not.
     original_backend->socket_addresses = erikslund::net::resolve_endpoints(
@@ -93,6 +96,87 @@ TEST_CASE("routing reload replaces a backend whose address now resolves elsewher
     CHECK(erikslund::net::address_host(reloaded->socket_addresses.front().value) == "127.0.0.1");
     CHECK_FALSE(reloaded->healthy.load());
     CHECK(reloaded->active_connections.load() == 0);
+    CHECK(reloaded->metrics == original_backend->metrics);
+    CHECK(reloaded->metrics->active_connections.load() == 4);
+    CHECK(reloaded->metrics->connection_attempts.load() == 25);
+    CHECK(reloaded->metrics->connection_errors.load() == 2);
+}
+
+TEST_CASE("backend accounting survives configured address changes and draining sessions") {
+    auto config = routing_config();
+    const auto first = erikslund::routing::make_routing_table(config);
+    const auto original = first->pools[0].backends[0];
+    original->active_connections.store(4);
+    original->metrics->active_connections.store(4);
+    original->metrics->connection_attempts.store(25);
+    original->metrics->connection_errors.store(2);
+
+    config.pools[0].backends[0].address = "127.0.0.2:13333";
+    const auto replacement = erikslund::routing::make_routing_table(config, first);
+    const auto current = replacement->pools[0].backends[0];
+    REQUIRE(current != original);
+    REQUIRE(current->metrics == original->metrics);
+    current->healthy.store(true);
+    replacement->pools[0].backends[1]->healthy.store(true);
+    replacement->pools[0].backends[1]->active_connections.store(1);
+    CHECK(erikslund::routing::select_backend(*replacement, 0) == current);
+
+    current->active_connections.fetch_add(1);
+    current->metrics->active_connections.fetch_add(1);
+    current->metrics->connection_attempts.fetch_add(1);
+    original->active_connections.fetch_sub(1);
+    original->metrics->active_connections.fetch_sub(1);
+    original->metrics->connection_errors.fetch_add(1);
+    CHECK(current->active_connections.load() == 1);
+    CHECK(current->metrics->active_connections.load() == 4);
+    CHECK(current->metrics->connection_attempts.load() == 26);
+    CHECK(current->metrics->connection_errors.load() == 3);
+    CHECK(replacement->backend_metrics.size() == first->backend_metrics.size());
+}
+
+TEST_CASE("removed backends retain one accounting identity while previous sessions drain") {
+    auto config = routing_config();
+    const auto first = erikslund::routing::make_routing_table(config);
+    const auto original = first->pools[0].backends[0];
+    original->metrics->active_connections.store(4);
+    original->metrics->connection_attempts.store(25);
+    config.pools[0].backends.erase(config.pools[0].backends.begin());
+
+    const auto removed = erikslund::routing::make_routing_table(config, first);
+    REQUIRE(removed->backend_metrics.size() == 3);
+    CHECK(removed->backend_metrics.back().metrics.lock() == original->metrics);
+    CHECK(removed->backend_metrics.back().current_backend.expired());
+
+    const auto restored = erikslund::routing::make_routing_table(routing_config(), removed);
+    REQUIRE(restored->backend_metrics.size() == 3);
+    const auto current = restored->pools[0].backends[0];
+    CHECK(current != original);
+    CHECK(current->metrics == original->metrics);
+    CHECK(current->metrics->active_connections.load() == 4);
+    CHECK(current->metrics->connection_attempts.load() == 25);
+}
+
+TEST_CASE("removed accounting identities expire after their last routing generation drains") {
+    auto config = routing_config();
+    auto first = erikslund::routing::make_routing_table(config);
+    const std::weak_ptr<erikslund::routing::BackendMetrics> original =
+        first->pools[0].backends[0]->metrics;
+    const auto original_generation = original.lock()->generation;
+    config.pools[0].backends.erase(config.pools[0].backends.begin());
+    const auto removed = erikslund::routing::make_routing_table(config, first);
+    REQUIRE(removed->backend_metrics.size() == 3);
+    first.reset();
+    CHECK(original.expired());
+
+    const auto refreshed = erikslund::routing::make_routing_table(config, removed);
+    CHECK(refreshed->backend_metrics.size() == 2);
+    const auto restored = erikslund::routing::make_routing_table(routing_config(), refreshed);
+    CHECK(restored->backend_metrics.size() == 3);
+    CHECK(restored->pools[0].backends[0]->metrics->active_connections.load() == 0);
+    CHECK(restored->pools[0].backends[0]->metrics->connection_attempts.load() == 0);
+    CHECK(restored->pools[0].backends[0]->metrics->generation > original_generation);
+    const auto unchanged = erikslund::routing::make_routing_table(routing_config(), restored);
+    CHECK(unchanged->next_backend_metrics_generation == restored->next_backend_metrics_generation);
 }
 
 TEST_CASE("routing reload keeps the last known address when a backend stops resolving") {

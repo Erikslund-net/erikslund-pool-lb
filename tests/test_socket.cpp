@@ -3,7 +3,9 @@
 #include <chrono>
 #include <string>
 #include <string_view>
+#include <vector>
 
+#include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
 
@@ -51,4 +53,40 @@ TEST_CASE("nonblocking connects bind the requested outbound source address") {
 
     CHECK(connect_from(listener, "127.0.0.2") == "127.0.0.2");
     CHECK(connect_from(listener, "127.0.0.3") == "127.0.0.3");
+}
+
+TEST_CASE("IPv6 source-bound connects enable destination-aware port allocation") {
+    const auto source = erikslund::net::resolve_numeric_bind_host("::1");
+    std::vector<erikslund::net::UniqueFd> clients;
+    std::vector<erikslund::net::UniqueFd> accepted;
+    constexpr std::size_t kDestinationCount = 2;
+    for (std::size_t destination_index = 0; destination_index < kDestinationCount;
+         ++destination_index) {
+        auto listener = erikslund::net::create_listener(source, 1);
+        REQUIRE(listener);
+        auto destination = source;
+        REQUIRE(::getsockname(listener.get(),
+                              reinterpret_cast<sockaddr*>(&destination.value),
+                              &destination.length) == 0);
+        auto started = erikslund::net::start_connect(destination, &source);
+        REQUIRE(started.socket);
+        REQUIRE(erikslund::net::wait_fd(started.socket.get(), POLLOUT,
+                                        erikslund::net::SteadyClock::now() + 1s));
+#ifdef IP_BIND_ADDRESS_NO_PORT
+        int deferred_port = 0;
+        socklen_t option_length = sizeof(deferred_port);
+        REQUIRE(::getsockopt(started.socket.get(), IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT,
+                             &deferred_port, &option_length) == 0);
+        CHECK(deferred_port == 1);
+#endif
+        sockaddr_storage peer{};
+        socklen_t peer_length = sizeof(peer);
+        erikslund::net::UniqueFd connection(
+            ::accept4(listener.get(), reinterpret_cast<sockaddr*>(&peer), &peer_length,
+                      SOCK_CLOEXEC));
+        REQUIRE(connection);
+        CHECK(erikslund::net::address_host(peer) == "::1");
+        clients.push_back(std::move(started.socket));
+        accepted.push_back(std::move(connection));
+    }
 }

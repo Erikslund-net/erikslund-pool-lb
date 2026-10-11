@@ -7,7 +7,6 @@ import selectors
 import socket
 import struct
 
-
 BACKEND_NAME = os.environ.get("BACKEND_NAME", "unknown")
 RESPONSE_PADDING_BYTES = int(os.environ.get("RESPONSE_PADDING_BYTES", "0"))
 STALL_AFTER_REQUESTS = int(os.environ.get("STALL_AFTER_REQUESTS", "0"))
@@ -21,10 +20,13 @@ MAXIMUM_HTTP_REQUEST_BYTES = 4_096
 STRATUM_LISTENER = object()
 HEALTH_LISTENER = object()
 RESPONSE_PADDING = "x" * RESPONSE_PADDING_BYTES
-STALLED_CONNECTIONS: dict[int, "ConnectionState"] = {}
+STALLED_CONNECTIONS: dict[int, ConnectionState] = {}
+STRATUM_CONNECTIONS: dict[int, ConnectionState] = {}
+READS_PAUSED = False
+AUTO_STALL_ENABLED = True
 # Every mining.submit nonce this backend has accepted. A solo pool wins on exactly one of these, so
 # the resilience suite asserts the set is complete rather than merely large.
-ACCEPTED_SUBMIT_NONCES: set[str] = set()
+ACCEPTED_SUBMIT_COUNTS: dict[str, int] = {}
 
 if RESPONSE_PADDING_BYTES < 0 or RESPONSE_PADDING_BYTES > 1_048_576:
     raise ValueError("RESPONSE_PADDING_BYTES must be between 0 and 1048576")
@@ -85,7 +87,8 @@ def process_requests(state: ConnectionState) -> None:
         if request.get("method") == "mining.submit":
             params = request.get("params")
             if isinstance(params, list) and len(params) >= 5:
-                ACCEPTED_SUBMIT_NONCES.add(str(params[4]))
+                nonce = str(params[4])
+                ACCEPTED_SUBMIT_COUNTS[nonce] = ACCEPTED_SUBMIT_COUNTS.get(nonce, 0) + 1
         response = {
             "id": request.get("id"),
             "result": {"backend": BACKEND_NAME, "source": state.source},
@@ -95,7 +98,11 @@ def process_requests(state: ConnectionState) -> None:
             response["result"]["padding"] = RESPONSE_PADDING
         state.output.extend(json.dumps(response, separators=(",", ":")).encode() + b"\n")
         state.requests_processed += 1
-        if STALL_AFTER_REQUESTS and state.requests_processed >= STALL_AFTER_REQUESTS:
+        if READS_PAUSED or (
+            AUTO_STALL_ENABLED
+            and STALL_AFTER_REQUESTS
+            and state.requests_processed >= STALL_AFTER_REQUESTS
+        ):
             state.reads_stalled = True
             return
 
@@ -107,6 +114,7 @@ def close_connection(selector: selectors.BaseSelector, state: ConnectionState) -
     except KeyError:
         pass
     STALLED_CONNECTIONS.pop(descriptor, None)
+    STRATUM_CONNECTIONS.pop(descriptor, None)
     state.connection.close()
 
 
@@ -148,7 +156,34 @@ def accept_connections(
             return
         connection.setblocking(False)
         state = HealthConnectionState(connection) if health else ConnectionState(connection)
+        if not health:
+            STRATUM_CONNECTIONS[connection.fileno()] = state
         selector.register(connection, selectors.EVENT_READ, state)
+
+
+def set_reads_paused(selector: selectors.BaseSelector, paused: bool) -> None:
+    global READS_PAUSED, AUTO_STALL_ENABLED
+    READS_PAUSED = paused
+    AUTO_STALL_ENABLED = False
+    for state in list(STRATUM_CONNECTIONS.values()):
+        try:
+            state.reads_stalled = paused
+            if not paused:
+                process_requests(state)
+            events = selectors.EVENT_WRITE if state.output else 0
+            if not paused:
+                events |= selectors.EVENT_READ
+            try:
+                selector.unregister(state.connection)
+            except KeyError:
+                pass
+            if events:
+                selector.register(state.connection, events, state)
+                STALLED_CONNECTIONS.pop(state.connection.fileno(), None)
+            else:
+                STALLED_CONNECTIONS[state.connection.fileno()] = state
+        except (ConnectionError, json.JSONDecodeError, OSError, ValueError):
+            close_connection(selector, state)
 
 
 def service_health_connection(
@@ -169,7 +204,18 @@ def service_health_connection(
             if b"\r\n\r\n" in state.input:
                 if state.input.startswith(b"GET /submits HTTP/1."):
                     status = b"200 OK"
-                    body = ("\n".join(sorted(ACCEPTED_SUBMIT_NONCES)) + "\n").encode()
+                    body = ("\n".join(sorted(ACCEPTED_SUBMIT_COUNTS)) + "\n").encode()
+                elif state.input.startswith(b"GET /submit-counts HTTP/1."):
+                    status = b"200 OK"
+                    body = json.dumps(ACCEPTED_SUBMIT_COUNTS, separators=(",", ":")).encode()
+                elif state.input.startswith(b"POST /control/pause HTTP/1."):
+                    set_reads_paused(selector, True)
+                    status = b"200 OK"
+                    body = b"paused\n"
+                elif state.input.startswith(b"POST /control/resume HTTP/1."):
+                    set_reads_paused(selector, False)
+                    status = b"200 OK"
+                    body = b"resumed\n"
                 elif state.input.startswith(b"GET /health HTTP/1."):
                     status = b"200 OK"
                     body = b"ok\n"
@@ -206,22 +252,23 @@ def make_listener(port: int) -> socket.socket:
 
 
 def main() -> None:
-    with selectors.DefaultSelector() as selector:
-        with make_listener(LISTEN_PORT) as server, make_listener(
-            HEALTH_LISTEN_PORT
-        ) as health_server:
-            selector.register(server, selectors.EVENT_READ, STRATUM_LISTENER)
-            selector.register(health_server, selectors.EVENT_READ, HEALTH_LISTENER)
-            while True:
-                for key, mask in selector.select():
-                    if key.data is STRATUM_LISTENER:
-                        accept_connections(selector, server)
-                    elif key.data is HEALTH_LISTENER:
-                        accept_connections(selector, health_server, health=True)
-                    elif isinstance(key.data, HealthConnectionState):
-                        service_health_connection(selector, key.data, mask)
-                    else:
-                        service_connection(selector, key.data, mask)
+    with (
+        selectors.DefaultSelector() as selector,
+        make_listener(LISTEN_PORT) as server,
+        make_listener(HEALTH_LISTEN_PORT) as health_server,
+    ):
+        selector.register(server, selectors.EVENT_READ, STRATUM_LISTENER)
+        selector.register(health_server, selectors.EVENT_READ, HEALTH_LISTENER)
+        while True:
+            for key, mask in selector.select():
+                if key.data is STRATUM_LISTENER:
+                    accept_connections(selector, server)
+                elif key.data is HEALTH_LISTENER:
+                    accept_connections(selector, health_server, health=True)
+                elif isinstance(key.data, HealthConnectionState):
+                    service_health_connection(selector, key.data, mask)
+                else:
+                    service_connection(selector, key.data, mask)
 
 
 if __name__ == "__main__":

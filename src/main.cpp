@@ -6,7 +6,9 @@
 #include <csignal>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <format>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <stop_token>
@@ -24,6 +26,7 @@
 #endif
 
 #include "api/http_server.hpp"
+#include "core/capacity_snapshot.hpp"
 #include "core/config.hpp"
 #include "core/errors.hpp"
 #include "core/logging.hpp"
@@ -83,7 +86,7 @@ std::string config_path_from(int argument_count, char** arguments) {
     if (argument_count == 3 && std::string_view(arguments[1]) == "--config")
         return arguments[2];
     throw erikslund::core::ConfigError(
-        "usage: erikslund-pool-lb [--config PATH] | --health-check HOST:PORT");
+        "usage: erikslund-pool-lb [--config PATH] | --health-check HOST:PORT | --capacity-snapshot");
 }
 
 bool run_health_check(std::string_view address) {
@@ -149,6 +152,13 @@ void validate_file_descriptor_limit(const erikslund::core::Config& config) {
 int main(int argument_count, char** arguments) {
     using namespace erikslund;
     try {
+        if (argument_count == 2 && std::string_view(arguments[1]) == "--capacity-snapshot") {
+            // Docker exec shares the running daemon's PID, network and cgroup namespaces.
+            if (!std::filesystem::equivalent("/proc/1/exe", "/proc/self/exe"))
+                throw core::ConfigError("capacity snapshot requires the load balancer as PID 1");
+            std::cout << core::capacity_snapshot_json(1) << '\n';
+            return 0;
+        }
         if (argument_count == 3 && std::string_view(arguments[1]) == "--health-check")
             return run_health_check(arguments[2]) ? 0 : 1;
         const std::string config_path = config_path_from(argument_count, arguments);
@@ -196,6 +206,7 @@ int main(int argument_count, char** arguments) {
         auto next_tls_poll = std::chrono::steady_clock::now() + kTlsMaterialPollInterval;
         while (!stop_requested.load(std::memory_order_relaxed)) {
             if (reload_requested.exchange(false, std::memory_order_relaxed)) {
+                bool reloaded = false;
                 try {
                     auto replacement =
                         std::make_shared<const core::Config>(core::Config::from_file(config_path));
@@ -214,16 +225,17 @@ int main(int argument_count, char** arguments) {
                         auto replacement_routing = routing::make_routing_table(
                             *replacement,
                             state.runtime.load(std::memory_order_acquire)->routing);
-                        edge.reload_tls(*replacement);
-                        state.publish(replacement, replacement_routing);
+                        edge.reload(replacement, replacement_routing);
                         config = std::move(replacement);
-                        core::log::info("Configuration reloaded; new sessions use pool {}",
-                                        config->active_pool);
+                        reloaded = true;
                     }
                 } catch (const std::exception& error) {
                     core::log::warning("Configuration reload failed; keeping current settings: {}",
                                        error.what());
                 }
+                if (reloaded)
+                    core::log::info("Configuration reloaded; new sessions use pool {}",
+                                    config->active_pool);
             }
             const auto now = std::chrono::steady_clock::now();
             if (now >= next_address_refresh) {
@@ -241,17 +253,21 @@ int main(int argument_count, char** arguments) {
             }
             if (now >= next_tls_poll) {
                 next_tls_poll = now + kTlsMaterialPollInterval;
-                if (const std::string fingerprint = tls_material_fingerprint(*config);
+                if (std::string fingerprint = tls_material_fingerprint(*config);
                     fingerprint != tls_fingerprint) {
+                    bool reloaded = false;
                     try {
                         edge.reload_tls(*config);
                         // Only on success, so a certificate caught mid-write is retried rather
                         // than recorded as already applied.
-                        tls_fingerprint = fingerprint;
+                        tls_fingerprint = std::move(fingerprint);
+                        reloaded = true;
                     } catch (const std::exception& error) {
                         core::log::warning("TLS material changed but reload failed; "
                                            "keeping current credentials: {}", error.what());
                     }
+                    if (reloaded)
+                        core::log::info("TLS credentials reloaded after material change");
                 }
             }
             std::this_thread::sleep_for(kMainLoopInterval);

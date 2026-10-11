@@ -32,6 +32,8 @@ public:
 
     [[nodiscard]] SslContext context_for(std::size_t listener_index) const;
     void publish(std::vector<SslContext> contexts);
+    // Requires the initialized listener topology, checked by the reload coordinator.
+    void replace(std::vector<SslContext> contexts) noexcept;
 
 private:
     struct ContextSlot {

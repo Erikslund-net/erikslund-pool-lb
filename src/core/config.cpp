@@ -270,6 +270,8 @@ std::vector<std::string> Config::restart_required_changes(const Config& replacem
         changes.emplace_back("api_address");
     if (io_workers != replacement.io_workers)
         changes.emplace_back("io_workers");
+    if (limits.ipv6_prefix_bits != replacement.limits.ipv6_prefix_bits)
+        changes.emplace_back("limits.ipv6_prefix_bits");
     return changes;
 }
 

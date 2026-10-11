@@ -32,6 +32,9 @@ public:
     }
 
 private:
+    static constexpr std::size_t kMaximumRetainedBucketEntries = 64;
+    static constexpr std::size_t kBucketShrinkRatio = 4;
+
     struct Entry {
         TimerExpiry expiry;
         std::uint64_t due_tick;
@@ -43,6 +46,7 @@ private:
     };
 
     void insert(Entry entry);
+    static void trim_bucket(std::vector<Entry>& bucket) noexcept;
     static std::uint64_t tick_floor(Clock::time_point time);
     static std::uint64_t tick_at_or_after(Clock::time_point time);
 

@@ -18,6 +18,7 @@
 #include "core/service_state.hpp"
 #include "net/endpoint.hpp"
 #include "net/server.hpp"
+#include "net/socket.hpp"
 #include "routing/router.hpp"
 #include "socket_test_utils.hpp"
 
@@ -76,17 +77,19 @@ private:
 
     erikslund::test::BoundListener listener_;
     std::size_t expected_lines_;
-    std::jthread thread_;
     std::atomic<int> accepted_{0};
     mutable std::mutex mutex_;
     std::string request_;
+    std::jthread thread_;
 };
 
 class HalfCloseBackend {
 public:
-    HalfCloseBackend(std::size_t expected_request_bytes, std::string response)
+    HalfCloseBackend(std::size_t expected_request_bytes, std::string response,
+                      bool require_eof = false)
         : listener_(erikslund::test::bind_loopback_listener(true)),
           expected_request_bytes_(expected_request_bytes), response_(std::move(response)),
+          require_eof_(require_eof),
           thread_([this](const std::stop_token& token) { run(token); }) {}
 
     [[nodiscard]] std::uint16_t port() const noexcept {
@@ -124,7 +127,13 @@ private:
                     break;
                 request.append(input.data(), static_cast<std::size_t>(received));
             }
-            const bool complete_request = request.size() == expected_request_bytes_;
+            bool complete_request = request.size() == expected_request_bytes_;
+            if (complete_request && require_eof_) {
+                timeval timeout{.tv_sec = 2, .tv_usec = 0};
+                ::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+                char unexpected = '\0';
+                complete_request = ::recv(client.get(), &unexpected, 1, 0) == 0;
+            }
             {
                 std::lock_guard lock(mutex_);
                 request_ = std::move(request);
@@ -139,6 +148,7 @@ private:
     erikslund::test::BoundListener listener_;
     std::size_t expected_request_bytes_;
     std::string response_;
+    bool require_eof_;
     std::atomic<bool> completed_{false};
     mutable std::mutex mutex_;
     std::string request_;
@@ -299,8 +309,8 @@ TEST_CASE("reactor rejects before connect, expires setup, falls back, and relays
               "{\"id\":1,\"result\":true,\"error\":null}\n");
         REQUIRE(erikslund::test::wait_until([&backend] { return backend.accepted() == 1; }, 1s));
         CHECK(backend.request() == request);
-        CHECK(backend_state->connection_attempts.load() == 2);
-        CHECK(backend_state->connection_errors.load() == 1);
+        CHECK(backend_state->metrics->connection_attempts.load() == 2);
+        CHECK(backend_state->metrics->connection_errors.load() == 1);
     }
 
     edge.stop();
@@ -344,7 +354,59 @@ TEST_CASE("reactor relays many complete messages received in one client write") 
     edge.stop();
 }
 
+TEST_CASE("reactor retries a silently stalled connect within a subsecond overall deadline") {
+    const auto loopback = erikslund::net::resolve_numeric_bind_host("127.0.0.1");
+    auto stalled_listener = erikslund::net::create_listener(loopback, 0);
+    REQUIRE(stalled_listener);
+    auto stalled_address = loopback;
+    REQUIRE(::getsockname(stalled_listener.get(),
+                          reinterpret_cast<sockaddr*>(&stalled_address.value),
+                          &stalled_address.length) == 0);
+    // A full unaccepted Linux listen queue drops additional SYNs without requiring firewall
+    // privileges or depending on an unreachable address outside this test's network namespace.
+    auto filler = erikslund::net::connect_tcp(stalled_address, 1s);
+    REQUIRE(filler);
+    auto probe = erikslund::net::start_connect(stalled_address);
+    REQUIRE(probe.socket);
+    REQUIRE_FALSE(probe.connected);
+    pollfd descriptor{probe.socket.get(), POLLOUT, 0};
+    REQUIRE(::poll(&descriptor, 1, 30) == 0);
+    probe.socket.reset();
+
+    FakeBackend backend;
+    REQUIRE(backend.port() != 0);
+    const std::uint16_t listener_port = erikslund::test::unused_loopback_port();
+    auto mutable_config = reactor_config(listener_port, backend.port());
+    mutable_config.limits.upstream_connect_timeout_milliseconds = 600;
+    const auto config = std::make_shared<const erikslund::core::Config>(mutable_config);
+    erikslund::core::ServiceState state;
+    auto routing = erikslund::routing::make_routing_table(*config);
+    const auto backend_state = routing->pools.front().backends.front();
+    backend_state->healthy.store(true);
+    backend_state->socket_addresses.insert(backend_state->socket_addresses.begin(),
+                                            stalled_address);
+    state.publish(config, routing);
+    erikslund::net::EdgeServer edge(*config, state);
+    edge.start();
+
+    auto client = erikslund::test::connect_loopback(listener_port);
+    REQUIRE(client);
+    REQUIRE(erikslund::test::send_all(
+        client.get(), "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n"));
+    CHECK(erikslund::test::read_line(client.get()) ==
+          "{\"id\":1,\"result\":true,\"error\":null}\n");
+    CHECK(backend_state->metrics->connection_attempts.load() == 2);
+    CHECK(backend_state->metrics->connection_errors.load() == 1);
+    CHECK(state.stats.snapshot().timeouts_processed >= 1);
+    edge.stop();
+}
+
 TEST_CASE("reactor drains half-closed peers across multiple fairness budgets") {
+    bool require_eof = false;
+    SUBCASE("backend responds after its request bytes arrive") {}
+    SUBCASE("backend waits for the forwarded FIN before responding") {
+        require_eof = true;
+    }
     constexpr std::size_t kReadyEventBudgetBytes = 65'536;
     constexpr std::size_t kDirectionalPayloadBytes = kReadyEventBudgetBytes * 3;
     constexpr std::size_t kParameterBytes = 400;
@@ -356,7 +418,7 @@ TEST_CASE("reactor drains half-closed peers across multiple fairness budgets") {
                    "\"]}\n";
     const std::string response = patterned_payload(kDirectionalPayloadBytes);
 
-    HalfCloseBackend backend(request.size(), response);
+    HalfCloseBackend backend(request.size(), response, require_eof);
     REQUIRE(backend.port() != 0);
     const std::uint16_t listener_port = erikslund::test::unused_loopback_port();
     REQUIRE(listener_port != 0);
@@ -506,8 +568,8 @@ TEST_CASE("reactor retries alternate source addresses after a bind failure") {
           "{\"id\":1,\"result\":true,\"error\":null}\n");
     REQUIRE(erikslund::test::wait_until([&backend] { return backend.accepted() == 1; }, 1s));
     CHECK(backend.source_hosts() == std::vector<std::string>{"127.0.0.2"});
-    CHECK(backend_state->connection_attempts.load() == 2);
-    CHECK(backend_state->connection_errors.load() == 1);
+    CHECK(backend_state->metrics->connection_attempts.load() == 2);
+    CHECK(backend_state->metrics->connection_errors.load() == 1);
 
     edge.stop();
 }
@@ -669,10 +731,161 @@ TEST_CASE("a refused line is dropped without leaking its queue reservation or re
         2s));
     // The submit arriving after the refused line is itself the proof the session survived the
     // refusal; the backend closes once it has its three lines, so counting closes proves nothing.
-    CHECK(state.stats.snapshot().rejected_protocol == 1);
+    CHECK(state.stats.snapshot().rejected_protocol == 0);
+    CHECK(state.stats.snapshot().protocol_errors[static_cast<std::size_t>(
+              erikslund::stratum::ValidationError::InvalidMethod)] == 1);
 
     edge.stop();
     // The discarded bytes must hand back the process-wide reservation they were charged.
     REQUIRE(erikslund::test::wait_until(
         [&state] { return state.stats.queued_bytes.load() == 0; }, 2s));
+}
+
+TEST_CASE("reloaded shared byte limits apply to already admitted and new miner connections") {
+    FakeBackend backend;
+    const std::uint16_t listener_port = erikslund::test::unused_loopback_port();
+    const auto original = std::make_shared<const erikslund::core::Config>(
+        reactor_config(listener_port, backend.port()));
+    erikslund::core::ServiceState state;
+    auto routing = erikslund::routing::make_routing_table(*original);
+    routing->pools.front().backends.front()->healthy.store(true);
+    state.publish(original, routing);
+    erikslund::net::EdgeServer edge(*original, state);
+    edge.start();
+    auto existing_client = erikslund::test::connect_loopback(listener_port);
+    REQUIRE(existing_client);
+    REQUIRE(erikslund::test::wait_until(
+        [&state] { return state.stats.snapshot().accepted_connections == 1; }, 1s));
+
+    auto mutable_replacement = *original;
+    mutable_replacement.limits.byte_burst_per_ip = 16;
+    mutable_replacement.limits.bytes_per_second_per_ip = 1;
+    const auto replacement =
+        std::make_shared<const erikslund::core::Config>(mutable_replacement);
+    edge.reload(replacement, routing);
+    auto new_client = erikslund::test::connect_loopback(listener_port);
+    REQUIRE(new_client);
+    constexpr std::string_view subscribe =
+        "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
+    for (const int socket : {existing_client.get(), new_client.get()}) {
+        REQUIRE(erikslund::test::send_all(socket, subscribe));
+        CHECK(erikslund::test::read_to_close(socket).empty());
+    }
+    CHECK(state.stats.snapshot().rejected_traffic_rate == 2);
+    CHECK(backend.accepted() == 0);
+    edge.stop();
+}
+
+TEST_CASE("many invalid messages count only one actual protocol connection rejection") {
+    FakeBackend backend;
+    const std::uint16_t listener_port = erikslund::test::unused_loopback_port();
+    auto mutable_config = reactor_config(listener_port, backend.port());
+    mutable_config.limits.messages_per_second_per_connection = 1'000;
+    mutable_config.limits.message_burst_per_connection = 64;
+    const auto config = std::make_shared<const erikslund::core::Config>(mutable_config);
+    erikslund::core::ServiceState state;
+    auto routing = erikslund::routing::make_routing_table(*config);
+    routing->pools.front().backends.front()->healthy.store(true);
+    state.publish(config, routing);
+    erikslund::net::EdgeServer edge(*config, state);
+    edge.start();
+
+    auto client = erikslund::test::connect_loopback(listener_port);
+    REQUIRE(client);
+    std::string requests = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
+    constexpr std::size_t kInvalidMessageCount = 33;
+    for (std::size_t index = 0; index < kInvalidMessageCount; ++index)
+        requests += "{\"id\":2,\"method\":\"eth_submitLogin\",\"params\":[]}\n";
+    REQUIRE(erikslund::test::send_all(client.get(), requests));
+    erikslund::test::read_to_close(client.get());
+    CHECK(state.stats.snapshot().rejected_protocol == 1);
+    CHECK(state.stats.snapshot().protocol_errors[static_cast<std::size_t>(
+              erikslund::stratum::ValidationError::InvalidMethod)] == kInvalidMessageCount);
+    edge.stop();
+}
+
+TEST_CASE("established relay survives distinct-source rejection at a fully active tracking cap") {
+    constexpr std::size_t kRejectedSources = 128;
+    constexpr std::uint32_t kLoopbackSubnet = 0x7f000000U;
+    constexpr std::string_view kSubscribe =
+        "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
+    FakeBackend backend(kRejectedSources + 2);
+    const auto listener_port = erikslund::test::unused_loopback_port();
+    auto mutable_config = reactor_config(listener_port, backend.port());
+    mutable_config.io_workers = 2;
+    mutable_config.limits.max_tracked_client_ips = 1;
+    mutable_config.limits.messages_per_second_per_connection = 1'000;
+    mutable_config.limits.message_burst_per_connection = kRejectedSources + 2;
+    const auto config = std::make_shared<const erikslund::core::Config>(mutable_config);
+    erikslund::core::ServiceState state;
+    auto routing = erikslund::routing::make_routing_table(*config);
+    routing->pools.front().backends.front()->healthy.store(true);
+    state.publish(config, routing);
+    erikslund::net::EdgeServer edge(*config, state);
+    edge.start();
+    auto miner = erikslund::test::connect_loopback(listener_port);
+    REQUIRE(miner);
+    REQUIRE(erikslund::test::send_all(miner.get(), kSubscribe));
+    REQUIRE(erikslund::test::wait_until([&backend] { return backend.accepted() == 1; }, 1s));
+
+    for (std::size_t index = 0; index < kRejectedSources; ++index) {
+        const auto source = kLoopbackSubnet | static_cast<std::uint32_t>(index + 2);
+        auto rejected = erikslund::test::connect_loopback(listener_port, 0, source);
+        REQUIRE(rejected);
+        REQUIRE(erikslund::test::send_all(miner.get(), kSubscribe));
+        char byte = '\0';
+        CHECK(::recv(rejected.get(), &byte, 1, 0) == 0);
+    }
+    CHECK(state.stats.snapshot().rejected_source_capacity == kRejectedSources);
+    CHECK(state.stats.active_connections.load() == 1);
+    REQUIRE(erikslund::test::send_all(miner.get(), kSubscribe));
+    CHECK(erikslund::test::read_line(miner.get()) ==
+          "{\"id\":1,\"result\":true,\"error\":null}\n");
+    CHECK(backend.accepted() == 1);
+    CHECK(backend.request().size() == kSubscribe.size() * (kRejectedSources + 2));
+    edge.stop();
+    CHECK(state.stats.queued_bytes.load() == 0);
+}
+
+TEST_CASE("clustered setup deadlines release real sockets and admission leases") {
+    // Client and server descriptors share one process and must fit the default test-container limit.
+    constexpr std::size_t kIdleSessions = 128;
+    FakeBackend backend;
+    const auto listener_port = erikslund::test::unused_loopback_port();
+    auto mutable_config = reactor_config(listener_port, backend.port());
+    mutable_config.limits.max_connections = kIdleSessions;
+    mutable_config.limits.max_connections_per_ip = kIdleSessions;
+    mutable_config.limits.connection_burst_per_ip = kIdleSessions;
+    mutable_config.limits.global_connection_burst = kIdleSessions;
+    mutable_config.limits.connections_per_second_per_ip = 10'000;
+    mutable_config.limits.global_connections_per_second = 10'000;
+    const auto config = std::make_shared<const erikslund::core::Config>(mutable_config);
+    erikslund::core::ServiceState state;
+    auto routing = erikslund::routing::make_routing_table(*config);
+    routing->pools.front().backends.front()->healthy.store(true);
+    state.publish(config, routing);
+    erikslund::net::EdgeServer edge(*config, state);
+    edge.start();
+    std::vector<erikslund::net::UniqueFd> clients;
+    for (std::size_t index = 0; index < kIdleSessions; ++index) {
+        clients.push_back(erikslund::test::connect_loopback(listener_port));
+        REQUIRE(clients.back());
+    }
+    REQUIRE(erikslund::test::wait_until(
+        [&state] { return state.stats.snapshot().accepted_connections == kIdleSessions; }, 1s));
+    CHECK(erikslund::test::wait_until(
+        [&state] {
+            return state.stats.active_connections.load() == 0 &&
+                   state.stats.snapshot().timeouts_processed >= kIdleSessions;
+        }, 4s));
+    CHECK(state.stats.snapshot().timeouts_processed >= kIdleSessions);
+    CHECK(state.stats.queued_bytes.load() == 0);
+    CHECK(backend.accepted() == 0);
+    auto recovered = erikslund::test::connect_loopback(listener_port);
+    REQUIRE(recovered);
+    REQUIRE(erikslund::test::send_all(
+        recovered.get(), "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n"));
+    CHECK(erikslund::test::read_line(recovered.get()) ==
+          "{\"id\":1,\"result\":true,\"error\":null}\n");
+    edge.stop();
 }

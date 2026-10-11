@@ -56,7 +56,9 @@ limits:
   tls_handshake_timeout_seconds: 5
   first_message_timeout_seconds: 5
   upstream_connect_timeout_milliseconds: 1000
-  idle_timeout_seconds: 60
+  # Qualification opens 5,000 miners at 100/s before issuing relay traffic. Leave headroom
+  # for TLS setup and shared-runner contention; production keeps its own idle policy.
+  idle_timeout_seconds: 300
 protocol:
   additional_allowed_methods: []
   additional_initial_methods: []

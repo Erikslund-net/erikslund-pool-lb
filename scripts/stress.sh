@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hold thousands of real proxied SV1 sessions through the release service and selector backend.
+# Concurrency smoke: subscribe thousands of sessions, verify their count, then close them.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

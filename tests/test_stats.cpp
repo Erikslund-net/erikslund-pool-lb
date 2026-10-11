@@ -19,15 +19,21 @@ TEST_CASE("stats aggregate cache-local reactor counters") {
     stats.worker(0).record_protocol_error(
         erikslund::stratum::ValidationError::InvalidJson);
     stats.worker(1).record_event_batch(7, std::chrono::nanoseconds(123));
+    stats.worker(0).record_timeout_batch(2, std::chrono::nanoseconds(456));
+    stats.worker(1).record_timeout_batch(3, std::chrono::nanoseconds(123));
 
     const auto snapshot = stats.snapshot();
     CHECK(snapshot.client_bytes == 30);
     CHECK(snapshot.accepted_connections == 5);
-    CHECK(snapshot.rejected_protocol == 1);
+    CHECK(snapshot.rejected_protocol == 0);
     CHECK(snapshot.protocol_errors[static_cast<std::size_t>(
               erikslund::stratum::ValidationError::InvalidJson)] == 1);
     CHECK(snapshot.events_processed == 7);
     CHECK(snapshot.maximum_batch_processing_nanoseconds == 123);
+    CHECK(snapshot.timeouts_processed == 5);
+    CHECK(snapshot.timeout_batches == 2);
+    CHECK(snapshot.timeout_processing_nanoseconds == 579);
+    CHECK(snapshot.maximum_timeout_processing_nanoseconds == 456);
 }
 
 TEST_CASE("stats enforce a process-wide queued-byte budget") {

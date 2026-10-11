@@ -34,6 +34,7 @@ constexpr auto kRequestTimeout = std::chrono::seconds(3);
 constexpr auto kCertificateExpiryWarning = std::chrono::days(30);
 constexpr unsigned kHttpWorkers = 1;
 constexpr double kNanosecondsPerMillisecond = 1'000'000.0;
+constexpr double kNanosecondsPerSecond = 1'000'000'000.0;
 
 std::string html_escape(std::string_view value) {
     std::string output;
@@ -210,6 +211,24 @@ std::string metrics_body(const core::ServiceState& state,
     gauge("pool_lb_reactor_batch_processing_nanoseconds_max",
           "Longest non-empty epoll batch processing time since startup.",
           aggregate.maximum_batch_processing_nanoseconds);
+    counter("pool_lb_reactor_timeouts_processed_total",
+            "Session deadlines processed by all reactors.", aggregate.timeouts_processed);
+    counter("pool_lb_reactor_timeout_batches_total",
+            "Timer dispatch passes, including checks without expired deadlines.",
+            aggregate.timeout_batches);
+    output << "# HELP pool_lb_reactor_timeout_processing_seconds_total Seconds spent processing "
+              "timer dispatch, including checks without expired deadlines.\n"
+              "# TYPE pool_lb_reactor_timeout_processing_seconds_total counter\n"
+              "pool_lb_reactor_timeout_processing_seconds_total "
+           << static_cast<double>(aggregate.timeout_processing_nanoseconds) /
+                  kNanosecondsPerSecond
+           << "\n# HELP pool_lb_reactor_timeout_processing_seconds_max Longest "
+              "timer batch processing time since startup.\n"
+              "# TYPE pool_lb_reactor_timeout_processing_seconds_max gauge\n"
+              "pool_lb_reactor_timeout_processing_seconds_max "
+           << static_cast<double>(aggregate.maximum_timeout_processing_nanoseconds) /
+                  kNanosecondsPerSecond
+           << '\n';
     counter("pool_lb_tls_handshake_attempts_total", "TLS handshakes started.",
             aggregate.tls_handshake_attempts);
     counter("pool_lb_tls_handshake_successes_total", "TLS handshakes completed.",
@@ -230,7 +249,12 @@ std::string metrics_body(const core::ServiceState& state,
               "# HELP pool_lb_worker_events_processed_total Socket events by reactor worker.\n"
               "# TYPE pool_lb_worker_events_processed_total counter\n"
               "# HELP pool_lb_worker_batch_processing_nanoseconds_max Longest epoll batch by reactor worker.\n"
-              "# TYPE pool_lb_worker_batch_processing_nanoseconds_max gauge\n";
+              "# TYPE pool_lb_worker_batch_processing_nanoseconds_max gauge\n"
+              "# HELP pool_lb_worker_timeouts_processed_total Session deadlines by reactor worker.\n"
+              "# TYPE pool_lb_worker_timeouts_processed_total counter\n"
+              "# HELP pool_lb_worker_timeout_processing_seconds_max Longest timer batch by "
+              "reactor worker.\n"
+              "# TYPE pool_lb_worker_timeout_processing_seconds_max gauge\n";
     for (std::size_t worker_index = 0; worker_index < stats.worker_count(); ++worker_index) {
         const core::WorkerStats& worker = stats.worker(worker_index);
         output << "pool_lb_worker_connections_active{worker=\"" << worker_index << "\"} "
@@ -241,33 +265,50 @@ std::string metrics_body(const core::ServiceState& state,
                << "\"} "
                << worker.maximum_batch_processing_nanoseconds.load(std::memory_order_relaxed)
                << '\n';
+        output << "pool_lb_worker_timeouts_processed_total{worker=\"" << worker_index << "\"} "
+               << worker.timeouts_processed.load(std::memory_order_relaxed) << '\n';
+        output << "pool_lb_worker_timeout_processing_seconds_max{worker=\"" << worker_index
+               << "\"} "
+               << static_cast<double>(worker.maximum_timeout_processing_nanoseconds.load(
+                      std::memory_order_relaxed)) / kNanosecondsPerSecond
+               << '\n';
     }
     output << "# HELP pool_lb_backend_up Backend health (1 = up, 0 = down).\n"
               "# TYPE pool_lb_backend_up gauge\n"
-              "# HELP pool_lb_backend_connections_active Active sessions pinned to a backend.\n"
+              "# HELP pool_lb_backend_draining Backend removed from current routes (1 = draining).\n"
+              "# TYPE pool_lb_backend_draining gauge\n"
+              "# HELP pool_lb_backend_connections_active Active sessions pinned to a logical "
+              "backend, including draining addresses.\n"
               "# TYPE pool_lb_backend_connections_active gauge\n"
               "# HELP pool_lb_backend_connection_attempts_total Backend connection attempts.\n"
               "# TYPE pool_lb_backend_connection_attempts_total counter\n"
               "# HELP pool_lb_backend_connection_errors_total Backend connection failures.\n"
               "# TYPE pool_lb_backend_connection_errors_total counter\n";
-    for (const routing::PoolState& pool : routing.pools)
-        for (const auto& backend : pool.backends) {
-            const std::string pool_label = prometheus_label(pool.name);
-            const std::string backend_label = prometheus_label(backend->name);
-            std::string labels = "{pool=\"";
-            labels += pool_label;
-            labels += "\",backend=\"";
-            labels += backend_label;
-            labels += "\"}";
+    for (const routing::BackendMetricEntry& entry : routing.backend_metrics) {
+        const auto metrics = entry.metrics.lock();
+        if (!metrics)
+            continue;
+        const auto backend = entry.current_backend.lock();
+        const std::string pool_label = prometheus_label(metrics->pool);
+        const std::string backend_label = prometheus_label(metrics->name);
+        std::string labels = "{pool=\"";
+        labels += pool_label;
+        labels += "\",backend=\"";
+        labels += backend_label;
+        labels += "\"}";
+        if (backend)
             output << "pool_lb_backend_up" << labels << ' '
                    << (backend->healthy.load(std::memory_order_relaxed) ? 1 : 0) << '\n';
-            output << "pool_lb_backend_connections_active" << labels << ' '
-                   << backend->active_connections.load(std::memory_order_relaxed) << '\n';
-            output << "pool_lb_backend_connection_attempts_total" << labels << ' '
-                   << backend->connection_attempts.load(std::memory_order_relaxed) << '\n';
-            output << "pool_lb_backend_connection_errors_total" << labels << ' '
-                   << backend->connection_errors.load(std::memory_order_relaxed) << '\n';
-        }
+        output << "pool_lb_backend_draining" << labels << ' ' << (backend ? 0 : 1) << '\n';
+        output << "pool_lb_backend_connections_active" << labels << ' '
+               << metrics->active_connections.load(std::memory_order_relaxed) << '\n';
+        labels.pop_back();
+        labels += ",generation=\"" + std::to_string(metrics->generation) + "\"}";
+        output << "pool_lb_backend_connection_attempts_total" << labels << ' '
+               << metrics->connection_attempts.load(std::memory_order_relaxed) << '\n';
+        output << "pool_lb_backend_connection_errors_total" << labels << ' '
+               << metrics->connection_errors.load(std::memory_order_relaxed) << '\n';
+    }
     return output.str();
 }
 
@@ -312,13 +353,18 @@ std::string status_body(const core::ServiceState& state, const routing::RoutingT
              << human_duration(static_cast<std::uint64_t>(distance))
              << (expired ? " ago" : " remaining") << ")</td></tr>";
     }
-    for (const routing::PoolState& pool : routing.pools)
-        for (const auto& backend : pool.backends) {
-            const bool up = backend->healthy.load(std::memory_order_relaxed);
-            rows << "<tr><td>" << html_escape(pool.name + "/" + backend->name) << "</td><td class=\""
-                 << (up ? "ok" : "bad") << "\">" << (up ? "up" : "down") << " - "
-                 << backend->active_connections.load(std::memory_order_relaxed) << " sessions</td></tr>";
-        }
+    for (const routing::BackendMetricEntry& entry : routing.backend_metrics) {
+        const auto metrics = entry.metrics.lock();
+        if (!metrics)
+            continue;
+        const auto backend = entry.current_backend.lock();
+        const bool up = backend && backend->healthy.load(std::memory_order_relaxed);
+        rows << "<tr><td>" << html_escape(metrics->pool + "/" + metrics->name)
+             << "</td><td class=\"" << (backend ? (up ? "ok" : "bad") : "warn") << "\">"
+             << (backend ? (up ? "up" : "down") : "draining") << " - "
+             << metrics->active_connections.load(std::memory_order_relaxed)
+             << " sessions</td></tr>";
+    }
     return std::format(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<link rel=\"icon\" href=\"data:,\"><meta http-equiv=\"refresh\" content=\"5\">"

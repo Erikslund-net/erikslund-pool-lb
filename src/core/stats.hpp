@@ -40,6 +40,10 @@ struct alignas(kCacheLineBytes) WorkerStats {
     std::atomic<std::uint64_t> event_batches{0};
     std::atomic<std::uint64_t> batch_processing_nanoseconds{0};
     std::atomic<std::uint64_t> maximum_batch_processing_nanoseconds{0};
+    std::atomic<std::uint64_t> timeouts_processed{0};
+    std::atomic<std::uint64_t> timeout_batches{0};
+    std::atomic<std::uint64_t> timeout_processing_nanoseconds{0};
+    std::atomic<std::uint64_t> maximum_timeout_processing_nanoseconds{0};
     std::atomic<std::uint64_t> tls_handshake_attempts{0};
     std::atomic<std::uint64_t> tls_handshake_successes{0};
     std::atomic<std::uint64_t> tls_handshake_nanoseconds{0};
@@ -47,6 +51,8 @@ struct alignas(kCacheLineBytes) WorkerStats {
 
     void record_protocol_error(stratum::ValidationError error) noexcept;
     void record_event_batch(std::size_t events, std::chrono::nanoseconds processing_time) noexcept;
+    void record_timeout_batch(std::size_t timeouts,
+                              std::chrono::nanoseconds processing_time) noexcept;
 };
 
 struct StatsSnapshot {
@@ -72,6 +78,10 @@ struct StatsSnapshot {
     std::uint64_t event_batches = 0;
     std::uint64_t batch_processing_nanoseconds = 0;
     std::uint64_t maximum_batch_processing_nanoseconds = 0;
+    std::uint64_t timeouts_processed = 0;
+    std::uint64_t timeout_batches = 0;
+    std::uint64_t timeout_processing_nanoseconds = 0;
+    std::uint64_t maximum_timeout_processing_nanoseconds = 0;
     std::uint64_t tls_handshake_attempts = 0;
     std::uint64_t tls_handshake_successes = 0;
     std::uint64_t tls_handshake_nanoseconds = 0;

@@ -1,6 +1,7 @@
 #include "net/tls.hpp"
 
 #include <chrono>
+#include <cassert>
 #include <ctime>
 #include <format>
 
@@ -25,6 +26,11 @@ void TlsContextStore::publish(std::vector<SslContext> contexts) {
     } else if (contexts_.size() != contexts.size()) {
         throw core::ConfigError("TLS listener topology changed during context publication");
     }
+    replace(std::move(contexts));
+}
+
+void TlsContextStore::replace(std::vector<SslContext> contexts) noexcept {
+    assert(contexts_.size() == contexts.size());
     for (std::size_t index = 0; index < contexts.size(); ++index)
         contexts_[index]->context.store(std::move(contexts[index]),
                                         std::memory_order_release);

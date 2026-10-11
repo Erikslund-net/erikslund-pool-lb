@@ -257,3 +257,11 @@ TEST_CASE("certificate path changes reload without changing listener topology") 
     CHECK(current.restart_required_changes(replacement) ==
           std::vector<std::string>{"listeners"});
 }
+
+TEST_CASE("changing IPv6 admission identity requires a restart to preserve shared accounting") {
+    const auto current = erikslund::core::Config::from_string(std::string(kMinimalConfig));
+    auto replacement = current;
+    replacement.limits.ipv6_prefix_bits = 128;
+    CHECK(current.restart_required_changes(replacement) ==
+          std::vector<std::string>{"limits.ipv6_prefix_bits"});
+}

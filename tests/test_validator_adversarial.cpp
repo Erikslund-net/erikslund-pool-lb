@@ -13,6 +13,23 @@ using erikslund::stratum::ProtocolState;
 using erikslund::stratum::ValidationError;
 using erikslund::stratum::validate_request;
 
+TEST_CASE("validator rejects duplicate envelope fields instead of trusting parser key order") {
+    const ProtocolConfig config;
+    const ProtocolState state;
+    for (const std::string_view input : {
+             R"({"method":"admin.stop","method":"mining.subscribe","params":[]})",
+             R"({"method":"mining.subscribe","method":"admin.stop","params":[]})",
+             R"({"method":"mining.subscribe","params":[{}],"params":[]})",
+             R"({"method":"mining.subscribe","id":false,"id":1,"params":[]})",
+             R"({"method":"mining.subscribe","id":null,"id":1,"params":[]})",
+             R"({"method":"mining.subscribe","params":null,"params":[]})",
+             R"({"method":"mining.subscribe","m\u0065thod":"mining.subscribe","params":[]})"})
+        CHECK_FALSE(validate_request(input, state, config));
+    const ProtocolState established{.received_message = true};
+    CHECK_FALSE(validate_request(R"({"id":7,"result":null,"result":true})", established, config));
+    CHECK_FALSE(validate_request(R"({"id":7,"error":null,"error":[]})", established, config));
+}
+
 TEST_CASE("validator rejects non-object, truncated, and cross-protocol input") {
     const ProtocolConfig config;
     const ProtocolState state;

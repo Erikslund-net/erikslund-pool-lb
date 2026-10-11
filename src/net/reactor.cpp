@@ -24,6 +24,7 @@
 
 #include "core/errors.hpp"
 #include "core/logging.hpp"
+#include "net/deadline_queue.hpp"
 #include "net/pending_buffer.hpp"
 #include "net/proxy_protocol.hpp"
 #include "net/socket.hpp"
@@ -100,6 +101,31 @@ struct ListenerState {
     SteadyClock::time_point resume_at{};
 };
 
+class ActiveSlotGuard {
+public:
+    ActiveSlotGuard(core::Stats& stats, core::WorkerStats& worker) noexcept
+        : stats_(stats), worker_(worker) {}
+
+    ~ActiveSlotGuard() {
+        if (owned_) {
+            stats_.active_connections.fetch_sub(1, std::memory_order_relaxed);
+            worker_.active_connections.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    ActiveSlotGuard(const ActiveSlotGuard&) = delete;
+    ActiveSlotGuard& operator=(const ActiveSlotGuard&) = delete;
+
+    void release() noexcept {
+        owned_ = false;
+    }
+
+private:
+    core::Stats& stats_;
+    core::WorkerStats& worker_;
+    bool owned_ = true;
+};
+
 std::size_t compatible_source_count(const std::vector<SocketAddress>& sources,
                                     int family) {
     return static_cast<std::size_t>(
@@ -157,8 +183,10 @@ struct Session {
     stratum::ProtocolState protocol_state;
     bool backend_counted = false;
     bool client_read_closed = false;
+    bool upstream_write_closed = false;
     bool upstream_read_closed = false;
     bool queue_limit_exceeded = false;
+    bool protocol_rejected = false;
     bool client_read_paused = false;
     bool upstream_read_paused = false;
     // Whether each direction is over its OWN mark, tracked apart from the epoll-facing pause flags
@@ -359,7 +387,8 @@ public:
          core::WorkerStats& worker_stats, std::size_t expected_sessions)
         : tls_contexts_(tls_contexts), state_(state), rate_limiter_(rate_limiter),
           worker_stats_(worker_stats), epoll_(::epoll_create1(EPOLL_CLOEXEC)),
-          timer_wheel_(SteadyClock::now(), expected_sessions) {
+          timer_wheel_(SteadyClock::now(), expected_sessions),
+          connect_deadlines_(expected_sessions) {
         if (!epoll_)
             throw core::IoError(std::string("epoll_create1: ") + std::strerror(errno));
         sessions_.reserve(expected_sessions);
@@ -460,6 +489,12 @@ private:
 
     int epoll_wait_timeout(SteadyClock::time_point now) const {
         auto timeout = std::chrono::milliseconds(kEpollWaitMilliseconds);
+        if (const auto deadline = connect_deadlines_.next_deadline()) {
+            if (*deadline <= now)
+                return 0;
+            timeout = std::min(timeout,
+                               std::chrono::ceil<std::chrono::milliseconds>(*deadline - now));
+        }
         for (const ListenerState& listener : listener_states_) {
             if (listener.registered)
                 continue;
@@ -588,13 +623,12 @@ private:
                 continue;
             }
             worker_stats_.active_connections.fetch_add(1, std::memory_order_relaxed);
+            ActiveSlotGuard active_slot(state_.stats, worker_stats_);
             sockaddr_storage local_address{};
             socklen_t local_length = sizeof(local_address);
             if (::getsockname(client.get(), reinterpret_cast<sockaddr*>(&local_address),
-                              &local_length) < 0) {
-                release_active_slot();
+                              &local_length) < 0)
                 continue;
-            }
             const ClientKey admission_key =
                 client_rate_limit_key(peer_address, config->limits.ipv6_prefix_bits);
             RateLimiter::Admission admission =
@@ -614,7 +648,6 @@ private:
                 else
                     worker_stats_.rejected_rate_limit.fetch_add(1,
                                                                  std::memory_order_relaxed);
-                release_active_slot();
                 continue;
             }
 
@@ -632,13 +665,11 @@ private:
                 const SslContext tls_context = tls_contexts_.context_for(listener_index);
                 if (!tls_context) {
                     worker_stats_.rejected_tls.fetch_add(1, std::memory_order_relaxed);
-                    release_admission(session);
                     continue;
                 }
                 session.ssl = create_server_stream(*tls_context, session.client.get());
                 if (!session.ssl) {
                     worker_stats_.rejected_tls.fetch_add(1, std::memory_order_relaxed);
-                    release_admission(session);
                     continue;
                 }
                 session.stage = SessionStage::TlsHandshake;
@@ -653,13 +684,12 @@ private:
             }
             const std::uint64_t id = session.id;
             if (!try_add_fd(session.client.get(), EPOLLIN | EPOLLRDHUP,
-                            event_token(id, EventKind::Client))) {
-                release_admission(session);
+                            event_token(id, EventKind::Client)))
                 continue;
-            }
             const auto [iterator, inserted] = sessions_.emplace(id, std::move(session));
             if (!inserted)
                 throw core::IoError("duplicate reactor session identifier");
+            active_slot.release();
             Session& stored = iterator->second;
             schedule_timeout(stored);
             worker_stats_.accepted_connections.fetch_add(1, std::memory_order_relaxed);
@@ -861,7 +891,7 @@ private:
                 session.client_read_closed = true;
                 session.tls_operation = TlsOperation::None;
                 if (!session.line_buffer.empty()) {
-                    worker_stats_.record_protocol_error(stratum::ValidationError::InvalidShape);
+                    reject_protocol(session, stratum::ValidationError::InvalidShape);
                     return false;
                 }
                 return true;
@@ -878,8 +908,7 @@ private:
                 messages_this_event >
                     session.runtime->config->limits.max_messages_per_ready_event - messages ||
                 !consume_session_traffic(session, result.size, messages, now) ||
-                !rate_limiter_.consume_traffic(session.admission, result.size, messages,
-                                               session.runtime->config->limits, now)) {
+                !rate_limiter_.consume_traffic(session.admission, result.size, messages, now)) {
                 worker_stats_.rejected_traffic_rate.fetch_add(1,
                                                               std::memory_order_relaxed);
                 return false;
@@ -897,13 +926,18 @@ private:
         }
     }
 
+    void reject_protocol(Session& session, stratum::ValidationError error) {
+        worker_stats_.record_protocol_error(error);
+        session.protocol_rejected = true;
+    }
+
     bool commit_consumed(Session& session, std::size_t consumed) {
         if (consumed == 0)
             return true;
         const std::size_t maximum_buffer = session.runtime->config->limits.max_buffer_bytes;
         if (consumed > maximum_buffer ||
             session.to_upstream.size() > maximum_buffer - consumed) {
-            worker_stats_.record_protocol_error(stratum::ValidationError::InvalidShape);
+            reject_protocol(session, stratum::ValidationError::InvalidShape);
             return false;
         }
         session.to_upstream.append(std::string_view(session.line_buffer.data(), consumed));
@@ -928,7 +962,7 @@ private:
                 break;
             const std::size_t line_size = newline - consumed;
             if (line_size > session.runtime->config->limits.max_line_bytes) {
-                worker_stats_.record_protocol_error(stratum::ValidationError::InvalidShape);
+                reject_protocol(session, stratum::ValidationError::InvalidShape);
                 commit_consumed(session, consumed);
                 return false;
             }
@@ -939,6 +973,7 @@ private:
                 worker_stats_.record_protocol_error(validation.error);
                 if (!session.protocol_state.received_message ||
                     ++session.consecutive_protocol_errors > kMaximumConsecutiveProtocolErrors) {
+                    session.protocol_rejected = true;
                     commit_consumed(session, consumed);
                     return false;
                 }
@@ -963,7 +998,7 @@ private:
             return false;
         if (session.line_buffer.size() > session.runtime->config->limits.max_line_bytes ||
             session.to_upstream.size() > session.runtime->config->limits.max_buffer_bytes) {
-            worker_stats_.record_protocol_error(stratum::ValidationError::InvalidShape);
+            reject_protocol(session, stratum::ValidationError::InvalidShape);
             return false;
         }
         return true;
@@ -1038,7 +1073,7 @@ private:
             }
             --session.current_address_sources_remaining;
             --session.connect_candidates_remaining;
-            session.backend->connection_attempts.fetch_add(1, std::memory_order_relaxed);
+            session.backend->metrics->connection_attempts.fetch_add(1, std::memory_order_relaxed);
             ConnectStart started = start_connect(address, source);
             if (!started.socket) {
                 record_upstream_error(session);
@@ -1090,6 +1125,7 @@ private:
         session.stage = SessionStage::Relay;
         schedule_timeout(session);
         session.backend->active_connections.fetch_add(1, std::memory_order_relaxed);
+        session.backend->metrics->active_connections.fetch_add(1, std::memory_order_relaxed);
         session.backend_counted = true;
         return true;
     }
@@ -1113,7 +1149,7 @@ private:
 
     void record_upstream_error(Session& session) const {
         if (session.backend)
-            session.backend->connection_errors.fetch_add(1, std::memory_order_relaxed);
+            session.backend->metrics->connection_errors.fetch_add(1, std::memory_order_relaxed);
         worker_stats_.upstream_connect_errors.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -1169,6 +1205,19 @@ private:
     }
 
     bool update_interests(Session& session) {
+        // Forward a miner's FIN only after its validated bytes drain. Otherwise a backend
+        // waiting for end-of-request EOF never replies, or loses the tail under backpressure.
+        if (session.stage == SessionStage::Relay && session.upstream &&
+            session.client_read_closed && session.to_upstream.empty() &&
+            !session.upstream_write_closed) {
+            int result = 0;
+            do {
+                result = ::shutdown(session.upstream.get(), SHUT_WR);
+            } while (result < 0 && errno == EINTR);
+            if (result < 0 && errno != ENOTCONN)
+                return false;
+            session.upstream_write_closed = true;
+        }
         refresh_read_pause(session);
         const bool suppress_client_reads =
             session.client_read_closed ||
@@ -1223,31 +1272,49 @@ private:
 
     void schedule_timeout(Session& session) {
         ++session.timeout_generation;
-        timer_wheel_.schedule(session.id, session.timeout_generation,
-                              timeout_deadline(session));
+        if (session.stage == SessionStage::UpstreamConnect) {
+            timer_wheel_.cancel(session.id);
+            connect_deadlines_.schedule(session.id, session.timeout_generation,
+                                         timeout_deadline(session));
+        } else {
+            connect_deadlines_.cancel(session.id);
+            timer_wheel_.schedule(session.id, session.timeout_generation,
+                                  timeout_deadline(session));
+        }
     }
 
     void expire_timeouts(SteadyClock::time_point now) {
-        for (const TimerExpiry expiry : timer_wheel_.advance(now)) {
-            const auto iterator = sessions_.find(expiry.session_id);
-            if (iterator == sessions_.end() ||
-                iterator->second.timeout_generation != expiry.generation)
-                continue;
-            Session& session = iterator->second;
-            const SteadyClock::time_point deadline = timeout_deadline(session);
-            if (now < deadline) {
-                timer_wheel_.schedule(expiry.session_id, expiry.generation, deadline);
-            } else if (session.stage == SessionStage::UpstreamConnect) {
-                record_upstream_error(session);
-                discard_upstream(session);
-                if (now >= session.upstream_overall_deadline ||
-                    !start_next_upstream_connect(session))
-                    close_session(expiry.session_id);
-            } else {
-                if (session.stage == SessionStage::TlsHandshake)
-                    worker_stats_.rejected_tls.fetch_add(1, std::memory_order_relaxed);
+        const auto connect_expired = connect_deadlines_.advance(now);
+        for (const TimerExpiry expiry : connect_expired)
+            expire_timeout(expiry, now);
+        const auto idle_expired = timer_wheel_.advance(now);
+        for (const TimerExpiry expiry : idle_expired)
+            expire_timeout(expiry, now);
+        // Includes timer dispatch and session cleanup, which epoll event-batch timing excludes.
+        worker_stats_.record_timeout_batch(
+            connect_expired.size() + idle_expired.size(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(SteadyClock::now() - now));
+    }
+
+    void expire_timeout(TimerExpiry expiry, SteadyClock::time_point now) {
+        const auto iterator = sessions_.find(expiry.session_id);
+        if (iterator == sessions_.end() ||
+            iterator->second.timeout_generation != expiry.generation)
+            return;
+        Session& session = iterator->second;
+        const SteadyClock::time_point deadline = timeout_deadline(session);
+        if (now < deadline) {
+            schedule_timeout(session);
+        } else if (session.stage == SessionStage::UpstreamConnect) {
+            record_upstream_error(session);
+            discard_upstream(session);
+            if (now >= session.upstream_overall_deadline ||
+                !start_next_upstream_connect(session))
                 close_session(expiry.session_id);
-            }
+        } else {
+            if (session.stage == SessionStage::TlsHandshake)
+                worker_stats_.rejected_tls.fetch_add(1, std::memory_order_relaxed);
+            close_session(expiry.session_id);
         }
     }
 
@@ -1266,14 +1333,19 @@ private:
         ::epoll_ctl(epoll_.get(), EPOLL_CTL_DEL, session.client.get(), nullptr);
         if (session.upstream)
             ::epoll_ctl(epoll_.get(), EPOLL_CTL_DEL, session.upstream.get(), nullptr);
-        if (session.backend_counted)
+        if (session.backend_counted) {
             session.backend->active_connections.fetch_sub(1, std::memory_order_relaxed);
+            session.backend->metrics->active_connections.fetch_sub(1, std::memory_order_relaxed);
+        }
         timer_wheel_.cancel(id);
+        connect_deadlines_.cancel(id);
         const std::size_t queued_bytes = session.line_buffer.size() +
                                          session.to_upstream.size() +
                                          session.to_client.size();
         state_.stats.release_queued_bytes(queued_bytes);
         release_admission(session);
+        if (session.protocol_rejected)
+            worker_stats_.rejected_protocol.fetch_add(1, std::memory_order_relaxed);
         worker_stats_.closed_connections.fetch_add(1, std::memory_order_relaxed);
         sessions_.erase(iterator);
     }
@@ -1286,6 +1358,7 @@ private:
     std::vector<ListenerState> listener_states_;
     std::unordered_map<std::uint64_t, Session> sessions_;
     TimerWheel timer_wheel_;
+    DeadlineQueue connect_deadlines_;
     std::uint64_t next_session_id_ = 1;
     std::uint64_t route_sequence_ = 0;
     std::uint64_t upstream_source_sequence_ = 0;

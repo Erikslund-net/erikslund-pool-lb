@@ -1,6 +1,10 @@
 /build/
 /cmake-build-*/
 /.cache/
+/.idea/
+/benchmark-results/
+/resilience-results/
+/soak-results/
 /compile_commands.json
 /conf/pool-lb.yml
 /conf/tls/

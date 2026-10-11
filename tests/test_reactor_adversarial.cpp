@@ -91,13 +91,15 @@ TEST_CASE("reactor rejects hostile first messages before opening an upstream soc
     excessive_nesting += '0';
     excessive_nesting.append(40, ']');
     excessive_nesting += "}\n";
-    const std::array<std::string, 8> payloads = {
+    const std::array<std::string, 10> payloads = {
         "GET / HTTP/1.1\r\n",
         "SSH-2.0-OpenSSH_9.0\r\n",
         std::string{"\x16\x03\x01\x00\x2a\n", 6},
         std::string{"\0\x01\x02\n", 4},
         "[]\n",
         "{\"id\":1,\"method\":true,\"params\":[]}\n",
+        "{\"method\":\"admin.stop\",\"method\":\"mining.subscribe\",\"params\":[]}\n",
+        "{\"m\\u0065thod\":\"admin.stop\",\"method\":\"mining.subscribe\",\"params\":[]}\n",
         excessive_nesting,
         std::string(256, 'a') + '\n',
     };

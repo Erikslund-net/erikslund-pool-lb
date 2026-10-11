@@ -1,6 +1,7 @@
 #include "net/timer_wheel.hpp"
 
 #include <algorithm>
+#include <new>
 #include <utility>
 
 namespace erikslund::net {
@@ -32,34 +33,75 @@ void TimerWheel::cancel(std::uint64_t session_id) {
             swapped->second = {.bucket = location->second.bucket, .index = index};
     }
     bucket.pop_back();
+    trim_bucket(bucket);
     locations_.erase(location);
 }
 
 std::vector<TimerExpiry> TimerWheel::advance(Clock::time_point now) {
     std::vector<TimerExpiry> expired;
     const std::uint64_t target_tick = tick_floor(now);
-    while (current_tick_ < target_tick) {
-        ++current_tick_;
-        std::vector<Entry> entries =
-            std::move(buckets_[current_tick_ % kBucketCount]);
-        buckets_[current_tick_ % kBucketCount].clear();
-        for (Entry& entry : entries) {
-            locations_.erase(entry.expiry.session_id);
-            if (entry.due_tick <= current_tick_)
+    if (target_tick <= current_tick_)
+        return expired;
+    const std::uint64_t ticks = std::min<std::uint64_t>(target_tick - current_tick_, kBucketCount);
+    std::size_t expiry_count = 0;
+    for (std::uint64_t offset = 1; offset <= ticks; ++offset)
+        for (const Entry& entry : buckets_[(current_tick_ + offset) % kBucketCount])
+            expiry_count += static_cast<std::size_t>(entry.due_tick <= target_tick);
+    // Reserve before touching indexes: cleanup must remain safe if allocation fails. Compact
+    // buckets in place so long-lived timers and bucket capacity survive ring rotations.
+    expired.reserve(expiry_count);
+    for (std::uint64_t offset = 1; offset <= ticks; ++offset) {
+        const std::size_t bucket_index = (current_tick_ + offset) % kBucketCount;
+        auto& bucket = buckets_[bucket_index];
+        std::size_t retained = 0;
+        for (const Entry& entry : bucket) {
+            if (entry.due_tick <= target_tick) {
                 expired.push_back(entry.expiry);
-            else
-                insert(entry);
+                locations_.erase(entry.expiry.session_id);
+            } else {
+                bucket[retained] = entry;
+                locations_.find(entry.expiry.session_id)->second =
+                    {.bucket = bucket_index, .index = retained};
+                ++retained;
+            }
         }
+        bucket.resize(retained);
+        trim_bucket(bucket);
     }
+    current_tick_ = target_tick;
     return expired;
+}
+
+void TimerWheel::trim_bucket(std::vector<Entry>& bucket) noexcept {
+    // A different bucket can see the fleet's peak on every tick. Retaining every high-water
+    // allocation would multiply peak session memory by the ring size after repeated churn.
+    if (bucket.capacity() <= kMaximumRetainedBucketEntries ||
+        bucket.size() > bucket.capacity() / kBucketShrinkRatio)
+        return;
+    if (bucket.empty()) {
+        std::vector<Entry>().swap(bucket);
+        return;
+    }
+    try {
+        std::vector<Entry>(bucket).swap(bucket);
+    } catch (const std::bad_alloc&) {
+        // Shrinking is best effort. Indexes stay valid and expiry/cleanup must still complete
+        // if the allocator cannot provide even the smaller replacement.
+        return;
+    }
 }
 
 void TimerWheel::insert(Entry entry) {
     const std::size_t bucket_index = entry.due_tick % kBucketCount;
     auto& bucket = buckets_[bucket_index];
-    locations_[entry.expiry.session_id] =
-        {.bucket = bucket_index, .index = bucket.size()};
-    bucket.push_back(entry);
+    const auto location = locations_.emplace(
+        entry.expiry.session_id, Location{.bucket = bucket_index, .index = bucket.size()}).first;
+    try {
+        bucket.push_back(entry);
+    } catch (...) {
+        locations_.erase(location);
+        throw;
+    }
 }
 
 std::uint64_t TimerWheel::tick_at_or_after(Clock::time_point time) {

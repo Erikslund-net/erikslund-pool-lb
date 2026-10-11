@@ -43,7 +43,8 @@ inline std::uint16_t unused_loopback_port() {
     return bind_loopback_listener().port;
 }
 
-inline net::UniqueFd connect_loopback(std::uint16_t port, int receive_buffer_bytes = 0) {
+inline net::UniqueFd connect_loopback(std::uint16_t port, int receive_buffer_bytes = 0,
+                                       std::uint32_t source_address = 0) {
     net::UniqueFd socket(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP));
     if (!socket)
         return {};
@@ -53,6 +54,13 @@ inline net::UniqueFd connect_loopback(std::uint16_t port, int receive_buffer_byt
     if (receive_buffer_bytes > 0)
         ::setsockopt(socket.get(), SOL_SOCKET, SO_RCVBUF, &receive_buffer_bytes,
                      sizeof(receive_buffer_bytes));
+    if (source_address != 0) {
+        sockaddr_in source{};
+        source.sin_family = AF_INET;
+        source.sin_addr.s_addr = htonl(source_address);
+        if (::bind(socket.get(), reinterpret_cast<const sockaddr*>(&source), sizeof(source)) < 0)
+            return {};
+    }
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);

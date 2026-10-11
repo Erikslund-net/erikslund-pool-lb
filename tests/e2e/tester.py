@@ -8,10 +8,12 @@ import math
 import os
 import platform
 import random
+import secrets
 import selectors
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.request
 
@@ -36,6 +38,8 @@ BENCHMARK_SCENARIOS = {
 }
 BACKPRESSURE_SCENARIOS = {"stalled-client", "stalled-upstream"}
 BENCHMARK_METRICS = (
+    "pool_lb_connections_active",
+    "pool_lb_io_workers",
     "pool_lb_connections_accepted_total",
     "pool_lb_connections_closed_total",
     "pool_lb_connections_rejected_protocol_total",
@@ -49,10 +53,21 @@ BENCHMARK_METRICS = (
     "pool_lb_queued_bytes",
     "pool_lb_queued_bytes_limit",
     "pool_lb_queued_bytes_high_water",
+    "pool_lb_relay_client_reads_paused_total",
+    "pool_lb_relay_upstream_reads_paused_total",
+    "pool_lb_relay_shared_pressure_pauses_total",
 )
 MAXIMUM_SCHEDULE_BURST = 1_024
 BACKPRESSURE_METRICS_INTERVAL_SECONDS = 0.05
 BACKPRESSURE_RECEIVE_BUFFER_BYTES = 1_024
+BACKPRESSURE_RECOVERY_RECEIVE_BUFFER_BYTES = 65_536
+BACKPRESSURE_PAUSE_METRICS = (
+    "pool_lb_relay_client_reads_paused_total",
+    "pool_lb_relay_upstream_reads_paused_total",
+    "pool_lb_relay_shared_pressure_pauses_total",
+)
+MAXIMUM_RESILIENCE_MINERS = 128
+MAXIMUM_BACKPRESSURE_SUBMITS = 262_144
 
 TLS_CLIENT_CONTEXT: ssl.SSLContext | None = None
 if USE_TLS:
@@ -78,18 +93,38 @@ class StalledWriteState:
     def __init__(
         self,
         session: BenchmarkSession,
-        payload: bytes,
-        operations: int,
-        pressure_bytes_per_operation: int,
+        nonce_prefix: str,
+        padded_request: bool,
+        bytes_per_session: int,
+        response_padding_bytes: int,
     ) -> None:
         self.session = session
-        self.payload = payload
-        self.operations_remaining = operations
-        self.pressure_bytes_per_operation = pressure_bytes_per_operation
+        self.nonce_prefix = nonce_prefix
+        self.padded_request = padded_request
         self.offset = 0
         self.generator_bytes_sent = 0
         self.operations_sent = 0
         self.pressure_bytes_offered = 0
+        self.payload = self.next_payload()
+        self.pressure_bytes_per_operation = (
+            len(self.payload) if padded_request else response_padding_bytes
+        )
+        self.operations_remaining = math.ceil(bytes_per_session / self.pressure_bytes_per_operation)
+        self.partial_nonce = ""
+        self.retry_pending = False
+
+    def nonce(self, operation: int) -> str:
+        return f"{self.nonce_prefix}-{operation}"
+
+    def next_payload(self) -> bytes:
+        fields = ["x" * 512] * 4 if self.padded_request else [
+            "qualification.worker", "job", "00000000", "00000000"
+        ]
+        return encoded_request(
+            2_000_000 + self.operations_sent,
+            "mining.submit",
+            [*fields, self.nonce(self.operations_sent)],
+        )
 
 
 class LatencySamples:
@@ -198,49 +233,70 @@ def wait_for_successful_tls_reload(previous_count: int) -> None:
 def persistent_tls_session() -> None:
     if not USE_TLS:
         raise AssertionError("persistent TLS session requires LB_TLS=1")
-    with connect() as connection:
-        with connection.makefile("rb") as responses:
-            subscribe = {
-                "id": 1,
-                "method": "mining.subscribe",
-                "params": ["e2e/rotation"],
-            }
-            connection.sendall(
-                json.dumps(subscribe, separators=(",", ":")).encode() + b"\n"
-            )
-            first_line = responses.readline()
-            if not first_line:
-                raise AssertionError("persistent TLS session closed during initialization")
-            first_response = json.loads(first_line)
-            if first_response["result"]["backend"] != "primary":
-                raise AssertionError("persistent TLS session reached the wrong backend")
+    with connect() as connection, connection.makefile("rb") as responses:
+        subscribe = {
+            "id": 1,
+            "method": "mining.subscribe",
+            "params": ["e2e/rotation"],
+        }
+        connection.sendall(
+            json.dumps(subscribe, separators=(",", ":")).encode() + b"\n"
+        )
+        first_line = responses.readline()
+        if not first_line:
+            raise AssertionError("persistent TLS session closed during initialization")
+        first_response = json.loads(first_line)
+        if first_response["result"]["backend"] != "primary":
+            raise AssertionError("persistent TLS session reached the wrong backend")
 
-            reload_generation = successful_tls_reload_count()
-            print("ok: persistent TLS session established", flush=True)
+        reload_generation = successful_tls_reload_count()
+        print("ok: persistent TLS session established", flush=True)
 
-            wait_for_successful_tls_reload(reload_generation)
-            authorize = {
-                "id": 2,
-                "method": "mining.authorize",
-                "params": ["e2e.worker", "x"],
-            }
-            connection.sendall(
-                json.dumps(authorize, separators=(",", ":")).encode() + b"\n"
+        wait_for_successful_tls_reload(reload_generation)
+        authorize = {
+            "id": 2,
+            "method": "mining.authorize",
+            "params": ["e2e.worker", "x"],
+        }
+        connection.sendall(
+            json.dumps(authorize, separators=(",", ":")).encode() + b"\n"
+        )
+        second_line = responses.readline()
+        if not second_line:
+            raise AssertionError(
+                "persistent TLS session closed after certificate rotation"
             )
-            second_line = responses.readline()
-            if not second_line:
-                raise AssertionError(
-                    "persistent TLS session closed after certificate rotation"
-                )
-            second_response = json.loads(second_line)
-            if (
-                second_response["id"] != 2
-                or second_response["result"]["backend"] != "primary"
-            ):
-                raise AssertionError(
-                    "persistent TLS session failed after certificate rotation"
-                )
-            print("ok: established TLS session survived certificate rotation", flush=True)
+        second_response = json.loads(second_line)
+        if (
+            second_response["id"] != 2
+            or second_response["result"]["backend"] != "primary"
+        ):
+            raise AssertionError(
+                "persistent TLS session failed after certificate rotation"
+            )
+        print("ok: established TLS session survived certificate rotation", flush=True)
+
+
+def persistent_routing_session() -> None:
+    with connect() as connection, connection.makefile("rb") as responses:
+        connection.sendall(encoded_request(1, "mining.subscribe", ["e2e/routing"]))
+        if json.loads(responses.readline())["result"]["backend"] != "primary":
+            raise AssertionError("persistent routing session did not start on primary")
+        print("ok: persistent routing session established", flush=True)
+        deadline = time.monotonic() + TLS_RELOAD_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            with connect() as probe, probe.makefile("rb") as probe_responses:
+                probe.sendall(encoded_request(1, "mining.subscribe", ["e2e/new-routing"]))
+                if json.loads(probe_responses.readline())["result"]["backend"] == "secondary":
+                    break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("atomic configuration replacement did not route new sessions")
+        connection.sendall(encoded_request(2, "mining.authorize", ["e2e.worker", "x"]))
+        response = json.loads(responses.readline())
+        if response["id"] != 2 or response["result"]["backend"] != "primary":
+            raise AssertionError("configuration reload moved or closed the old session")
+        print("ok: atomic reload routes new sessions to secondary and retains primary session")
 
 
 def metric_value(metrics: str, name: str) -> int:
@@ -758,6 +814,14 @@ def run_idle_benchmark(
     return {"sessions_alive_after_hold": alive}
 
 
+def control_backend(action: str) -> None:
+    url = os.environ.get("BENCH_BACKEND_CONTROL_URL", "http://pool-primary:7777/control")
+    request = urllib.request.Request(f"{url.rstrip('/')}/{action}", data=b"", method="POST")
+    with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        if response.status != 200:
+            raise AssertionError(f"backend {action} failed")
+
+
 def run_stalled_benchmark(
     selector: selectors.BaseSelector,
     sessions: list[BenchmarkSession],
@@ -769,169 +833,180 @@ def run_stalled_benchmark(
     before_metrics: dict[str, float],
 ) -> dict[str, object]:
     ready_sessions = [session for session in sessions if session.ready and not session.closed]
-    if scenario == "stalled-client":
-        payload = encoded_request(
-            2_000_000,
-            "mining.submit",
-            ["qualification.worker", "job", "00000000", "00000000", "00000000"],
-        )
-        pressure_bytes_per_operation = max(response_padding_bytes, 1)
-        direction = "upstream_to_client"
-    else:
-        payload = encoded_request(
-            2_000_000,
-            "mining.submit",
-            ["x" * 512, "x" * 512, "x" * 512, "x" * 512, "x" * 512],
-        )
-        pressure_bytes_per_operation = len(payload)
-        direction = "client_to_upstream"
-    operations_per_session = math.ceil(bytes_per_session / pressure_bytes_per_operation)
-
+    padded_request = scenario == "stalled-upstream"
+    direction = "client_to_upstream" if padded_request else "upstream_to_client"
+    run_id = secrets.token_hex(8)
     writers: list[StalledWriteState] = []
     setup_errors: list[str] = []
-    for session in ready_sessions:
-        try:
+    metric_errors: list[str] = []
+    received_latencies = LatencySamples(1, 0x5A17)
+    connection_latencies = LatencySamples(1, 0xC011)
+    queued_bytes_before = before_metrics.get("pool_lb_queued_bytes", 0.0)
+    high_water_before = before_metrics.get("pool_lb_queued_bytes_high_water", 0.0)
+    high_water_observed = high_water_before
+    maximum_queued = queued_bytes_before
+    pauses_before = sum(before_metrics.get(name, 0.0) for name in BACKPRESSURE_PAUSE_METRICS)
+    pauses_observed = pauses_before
+    started = time.monotonic()
+    if padded_request:
+        control_backend("pause")
+    try:
+        for index, session in enumerate(ready_sessions):
             selector.unregister(session.connection)
-            if scenario == "stalled-client":
+            if not padded_request:
                 session.connection.setsockopt(
-                    socket.SOL_SOCKET,
-                    socket.SO_RCVBUF,
-                    BACKPRESSURE_RECEIVE_BUFFER_BYTES,
+                    socket.SOL_SOCKET, socket.SO_RCVBUF, BACKPRESSURE_RECEIVE_BUFFER_BYTES
                 )
             writer = StalledWriteState(
-                session,
-                payload,
-                operations_per_session,
-                pressure_bytes_per_operation,
+                session, f"{run_id}-{index}", padded_request, bytes_per_session, response_padding_bytes
             )
+            if writer.operations_remaining * len(ready_sessions) > MAXIMUM_BACKPRESSURE_SUBMITS:
+                raise ValueError(
+                    f"stalled scenarios are bounded to {MAXIMUM_BACKPRESSURE_SUBMITS} total submits"
+                )
             selector.register(session.connection, selectors.EVENT_WRITE, writer)
             writers.append(writer)
-        except (KeyError, OSError, ValueError) as error:
-            if len(setup_errors) < 20:
-                setup_errors.append(str(error))
-            close_benchmark_session(selector, session)
 
-    queue_rejections_before = before_metrics.get(
-        "pool_lb_connections_rejected_queue_limit_total", 0.0
-    )
-    queued_bytes_before = before_metrics.get("pool_lb_queued_bytes", 0.0)
-    queue_high_water_before = before_metrics.get("pool_lb_queued_bytes_high_water", 0.0)
-    queue_rejections_observed = queue_rejections_before
-    queued_bytes_observed = queued_bytes_before
-    maximum_queued_bytes_observed = queued_bytes_before
-    queue_high_water_observed = queue_high_water_before
-    metric_errors: list[str] = []
-    connections_closed = 0
-    started = time.monotonic()
-    deadline = started + duration_seconds
-    next_metrics = started
-
-    while time.monotonic() < deadline:
-        now = time.monotonic()
-        timeout = min(max(next_metrics - now, 0.0), 0.05)
-        for key, _ in selector.select(timeout=timeout):
-            writer = key.data
-            if not isinstance(writer, StalledWriteState):
-                continue
-            try:
-                sent = writer.session.connection.send(writer.payload[writer.offset :])
-                if sent == 0:
-                    continue
-                writer.generator_bytes_sent += sent
-                writer.offset += sent
-                if writer.offset == len(writer.payload):
-                    writer.offset = 0
-                    writer.operations_remaining -= 1
-                    writer.operations_sent += 1
-                    writer.pressure_bytes_offered += writer.pressure_bytes_per_operation
-                    if writer.operations_remaining == 0:
-                        selector.unregister(writer.session.connection)
-            except ssl.SSLWantReadError:
-                selector.modify(
-                    writer.session.connection,
-                    selectors.EVENT_READ | selectors.EVENT_WRITE,
-                    writer,
+        started = time.monotonic()
+        deadline = started + duration_seconds
+        next_metrics = started
+        while time.monotonic() < deadline:
+            for key, _ in selector.select(timeout=0.05):
+                writer = key.data
+                try:
+                    sent = writer.session.connection.send(writer.payload[writer.offset:])
+                    writer.retry_pending = False
+                    writer.generator_bytes_sent += sent
+                    writer.offset += sent
+                    if writer.offset == len(writer.payload):
+                        request_id = 2_000_000 + writer.operations_sent
+                        writer.session.pending[request_id] = time.perf_counter_ns()
+                        writer.offset = 0
+                        writer.operations_remaining -= 1
+                        writer.operations_sent += 1
+                        writer.pressure_bytes_offered += writer.pressure_bytes_per_operation
+                        if writer.operations_remaining == 0:
+                            selector.unregister(writer.session.connection)
+                        else:
+                            writer.payload = writer.next_payload()
+                except ssl.SSLWantReadError:
+                    writer.retry_pending = True
+                    selector.modify(
+                        writer.session.connection,
+                        selectors.EVENT_READ | selectors.EVENT_WRITE,
+                        writer,
+                    )
+                except ssl.SSLWantWriteError:
+                    writer.retry_pending = True
+                except BlockingIOError:
+                    pass
+                except (ConnectionError, OSError, ValueError) as error:
+                    close_benchmark_session(selector, writer.session, str(error))
+            if time.monotonic() >= next_metrics:
+                observed, metrics_error = scrape_metrics()
+                if metrics_error and metrics_error not in metric_errors:
+                    metric_errors.append(metrics_error)
+                maximum_queued = max(maximum_queued, observed.get("pool_lb_queued_bytes", 0.0))
+                high_water_observed = max(
+                    high_water_observed, observed.get("pool_lb_queued_bytes_high_water", 0.0)
                 )
-            except (BlockingIOError, ssl.SSLWantWriteError):
-                pass
-            except (ConnectionError, OSError, ValueError):
-                connections_closed += 1
-                close_benchmark_session(selector, writer.session)
-
-        now = time.monotonic()
-        if now >= next_metrics:
-            observed, metrics_error = scrape_metrics()
-            if metrics_error and metrics_error not in metric_errors and len(metric_errors) < 20:
-                metric_errors.append(metrics_error)
-            queue_rejections_observed = observed.get(
-                "pool_lb_connections_rejected_queue_limit_total",
-                queue_rejections_observed,
-            )
-            queued_bytes_observed = observed.get(
-                "pool_lb_queued_bytes", queued_bytes_observed
-            )
-            maximum_queued_bytes_observed = max(
-                maximum_queued_bytes_observed, queued_bytes_observed
-            )
-            queue_high_water_observed = observed.get(
-                "pool_lb_queued_bytes_high_water", queue_high_water_observed
-            )
-            next_metrics = now + BACKPRESSURE_METRICS_INTERVAL_SECONDS
-            if queue_rejections_observed > queue_rejections_before:
-                break
-
+                pauses_observed = max(
+                    pauses_observed,
+                    sum(observed.get(name, 0.0) for name in BACKPRESSURE_PAUSE_METRICS),
+                )
+                next_metrics = time.monotonic() + BACKPRESSURE_METRICS_INTERVAL_SECONDS
+    finally:
+        if padded_request:
+            # Always restore the controlled fixture, including when the generator itself fails.
+            control_backend("resume")
     elapsed = time.monotonic() - started
+
     for writer in writers:
-        close_benchmark_session(selector, writer.session)
+        session = writer.session
+        if session.closed:
+            continue
+        try:
+            selector.unregister(session.connection)
+        except KeyError:
+            pass
+        if not padded_request:
+            session.connection.setsockopt(
+                socket.SOL_SOCKET, socket.SO_RCVBUF, BACKPRESSURE_RECOVERY_RECEIVE_BUFFER_BYTES
+            )
+        if writer.offset or writer.retry_pending:
+            # Complete the one started frame; never count unsent planned frames as delivered.
+            writer.partial_nonce = writer.nonce(writer.operations_sent)
+            session.pending[2_000_000 + writer.operations_sent] = time.perf_counter_ns()
+            session.output.extend(writer.payload[writer.offset:])
+        events = selectors.EVENT_READ
+        if session.output:
+            events |= selectors.EVENT_WRITE
+        selector.register(session.connection, events, session)
 
-    drain_completed = False
     drain_deadline = time.monotonic() + drain_seconds
+    queued_after_resume = math.inf
     while time.monotonic() < drain_deadline:
+        for key, mask in selector.select(timeout=0.05):
+            service_benchmark_session(
+                selector, key.data, mask, connection_latencies, received_latencies
+            )
         observed, metrics_error = scrape_metrics()
-        if metrics_error and metrics_error not in metric_errors and len(metric_errors) < 20:
+        if metrics_error and metrics_error not in metric_errors:
             metric_errors.append(metrics_error)
-        queue_rejections_observed = observed.get(
-            "pool_lb_connections_rejected_queue_limit_total", queue_rejections_observed
+        queued_after_resume = observed.get("pool_lb_queued_bytes", math.inf)
+        high_water_observed = max(
+            high_water_observed, observed.get("pool_lb_queued_bytes_high_water", 0.0)
         )
-        queued_bytes_observed = observed.get("pool_lb_queued_bytes", queued_bytes_observed)
-        maximum_queued_bytes_observed = max(
-            maximum_queued_bytes_observed, queued_bytes_observed
-        )
-        queue_high_water_observed = observed.get(
-            "pool_lb_queued_bytes_high_water", queue_high_water_observed
-        )
-        if not metrics_error and queued_bytes_observed <= queued_bytes_before:
-            drain_completed = True
+        if (
+            all(not session.pending and not session.output for session in ready_sessions)
+            and queued_after_resume <= queued_bytes_before
+        ):
             break
-        time.sleep(BACKPRESSURE_METRICS_INTERVAL_SECONDS)
 
+    expected = {
+        writer.nonce(operation)
+        for writer in writers
+        for operation in range(writer.operations_sent)
+    }
+    for writer in writers:
+        if writer.partial_nonce and not writer.session.output:
+            expected.add(writer.partial_nonce)
+    counts = accepted_submit_counts()
+    missing = sorted(nonce for nonce in expected if counts.get(nonce, 0) == 0)
+    duplicates = sorted(nonce for nonce in expected if counts.get(nonce, 0) > 1)
+    pending = sum(len(session.pending) for session in ready_sessions)
+    unfinished_bytes = sum(len(session.output) for session in ready_sessions)
+    alive = sum(not session.closed for session in ready_sessions)
+    delivered = (
+        bool(expected) and not missing and not duplicates and not pending and not unfinished_bytes
+        and alive == len(ready_sessions)
+    )
     return {
         "direction": direction,
         "sessions_started": len(writers),
-        "target_pressure_bytes_per_session": bytes_per_session,
-        "operations_per_session": operations_per_session,
-        "operations_sent": sum(writer.operations_sent for writer in writers),
-        "generator_bytes_sent": sum(writer.generator_bytes_sent for writer in writers),
-        "pressure_bytes_offered": sum(
+        "sessions_alive_after_resume": alive,
+        "elapsed_seconds": elapsed,
+        "generator_bytes_sent_before_resume": sum(writer.generator_bytes_sent for writer in writers),
+        "pressure_bytes_offered_before_resume": sum(
             writer.pressure_bytes_offered for writer in writers
         ),
-        "connections_closed_while_sending": connections_closed,
-        "elapsed_seconds": elapsed,
+        "complete_submits_sent_before_resume": sum(writer.operations_sent for writer in writers),
+        "submits_expected_after_resume": len(expected),
+        "submits_delivered": len(expected) - len(missing),
+        "submits_missing": len(missing),
+        "submits_duplicated": len(duplicates),
+        "responses_pending": pending,
+        "unfinished_generator_bytes": unfinished_bytes,
+        "delivered_exactly_once": delivered,
+        "lost_examples": missing[:5],
         "queue": {
-            "rejections_before": queue_rejections_before,
-            "rejections_observed": queue_rejections_observed,
-            "rejections_observed_delta": (
-                queue_rejections_observed - queue_rejections_before
-            ),
             "bytes_before": queued_bytes_before,
-            "bytes_after_close": queued_bytes_observed,
-            "maximum_bytes_observed": maximum_queued_bytes_observed,
-            "high_water_before": queue_high_water_before,
-            "high_water_observed": queue_high_water_observed,
-            "high_water_observed_increase": (
-                queue_high_water_observed - queue_high_water_before
-            ),
-            "drained_to_baseline": drain_completed,
+            "bytes_after_resume": queued_after_resume,
+            "drained_to_baseline": queued_after_resume <= queued_bytes_before,
+            "maximum_bytes_observed": maximum_queued,
+            "high_water_before": high_water_before,
+            "high_water_observed": high_water_observed,
+            "pauses_delta": pauses_observed - pauses_before,
         },
         "setup_errors": setup_errors,
         "metrics_errors": metric_errors,
@@ -961,7 +1036,7 @@ def run_churn_benchmark(
     latencies = LatencySamples(maximum_samples, 0xC4A7)
     started = time.monotonic()
     deadline = started + duration_seconds
-    operations_offered = int(math.ceil(duration_seconds * rate_per_second))
+    operations_offered = math.ceil(duration_seconds * rate_per_second)
     operations_scheduled = 0
     completed = 0
     errors: list[str] = []
@@ -1247,7 +1322,14 @@ def qualification_benchmark() -> bool:
                 errors.extend(backpressure["setup_errors"])
                 if backpressure["metrics_errors"]:
                     errors.append("metrics scrape failed during stalled-peer scenario")
+                    passed = False
                 if not bool(backpressure["queue"]["drained_to_baseline"]):
+                    passed = False
+                if not backpressure["delivered_exactly_once"]:
+                    errors.append("resumed traffic lost/duplicated submits or failed to receive all replies")
+                    passed = False
+                if backpressure["queue"]["pauses_delta"] < 1.0:
+                    errors.append("stalled-peer traffic did not exercise read backpressure")
                     passed = False
         finally:
             runtime_failures = sum(bool(session.error) for session in sessions)
@@ -1325,9 +1407,9 @@ def qualification_benchmark() -> bool:
             "bytes_after": queue_bytes_after,
         }
         result["backpressure"]["queue_validation"] = queue_validation
-        if queue_rejection_delta < 1.0:
+        if queue_rejection_delta != 0.0:
             passed = False
-            errors.append("stalled-peer traffic did not exercise the process queue limit")
+            errors.append("legitimate stalled-peer traffic was rejected instead of backpressured")
         if queue_high_water_after > queue_high_water_ceiling:
             passed = False
             errors.append(
@@ -1399,11 +1481,16 @@ def load(connection_count: int) -> None:
             connection.close()
 
 
-def accepted_submit_nonces() -> set[str]:
-    url = os.environ.get("E2E_POOL_SUBMITS_URL", "http://pool-primary:7777/submits")
+def accepted_submit_counts() -> dict[str, int]:
+    url = os.environ.get("E2E_POOL_SUBMIT_COUNTS_URL", "http://pool-primary:7777/submit-counts")
     with urllib.request.urlopen(url, timeout=TIMEOUT_SECONDS) as response:
-        body = response.read().decode()
-    return {line.strip() for line in body.splitlines() if line.strip()}
+        counts = json.load(response)
+    if not isinstance(counts, dict) or any(
+        not isinstance(nonce, str) or not isinstance(count, int) or count < 1
+        for nonce, count in counts.items()
+    ):
+        raise AssertionError("backend returned invalid submit counts")
+    return counts
 
 
 def share_integrity() -> bool:
@@ -1413,26 +1500,39 @@ def share_integrity() -> bool:
     submits_each = environment_integer("E2E_SUBMITS", 25, minimum=1)
     slow_read = os.environ.get("E2E_SLOW_READ", "0") == "1"
     scenario = os.environ.get("E2E_SCENARIO", "baseline")
+    simultaneous = os.environ.get("E2E_CONCURRENT", "0") == "1"
+    if miners > MAXIMUM_RESILIENCE_MINERS:
+        raise ValueError(f"E2E_MINERS must not exceed {MAXIMUM_RESILIENCE_MINERS}")
+    run_id = secrets.token_hex(8)
+    expected = {
+        f"{run_id}-m{miner_index}-s{submit_index}"
+        for miner_index in range(miners)
+        for submit_index in range(submits_each)
+    }
+    barrier = threading.Barrier(miners) if simultaneous else None
 
-    before = accepted_submit_nonces()
-    expected: set[str] = set()
-    connections: list[socket.socket] = []
-    try:
-        for miner_index in range(miners):
-            connection = connect()
-            connections.append(connection)
-            reader = connection.makefile("rb")
+    def exercise_miner(miner_index: int) -> float:
+        if barrier is not None:
+            barrier.wait(timeout=TIMEOUT_SECONDS)
+        started = time.monotonic()
+        with connect() as connection, connection.makefile("rb") as reader:
+            def expect_response(request_id: int) -> None:
+                response = json.loads(reader.readline())
+                if response.get("id") != request_id or response.get("error") is not None:
+                    raise AssertionError(f"miner {miner_index}: invalid response to {request_id}")
+                if response.get("result", {}).get("backend") != "primary":
+                    raise AssertionError(f"miner {miner_index}: wrong backend")
+
             connection.sendall(
                 encoded_request(1, "mining.subscribe", [f"resilience/{miner_index}"])
             )
-            reader.readline()
+            expect_response(1)
             connection.sendall(
                 encoded_request(2, "mining.authorize", [f"worker{miner_index}", "x"])
             )
-            reader.readline()
+            expect_response(2)
             for submit_index in range(submits_each):
-                nonce = f"{scenario}-m{miner_index}-s{submit_index}"
-                expected.add(nonce)
+                nonce = f"{run_id}-m{miner_index}-s{submit_index}"
                 connection.sendall(
                     encoded_request(
                         3 + submit_index,
@@ -1442,39 +1542,46 @@ def share_integrity() -> bool:
                 )
                 # A miner that reads its responses lazily must not cost anyone a share.
                 if not slow_read:
-                    reader.readline()
+                    expect_response(3 + submit_index)
             if slow_read:
                 time.sleep(0.2)
-                for _ in range(submits_each):
-                    reader.readline()
-    finally:
-        for connection in connections:
-            try:
-                connection.close()
-            except OSError:
-                pass
+                for submit_index in range(submits_each):
+                    expect_response(3 + submit_index)
+        return started
+
+    if simultaneous:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=miners, thread_name_prefix="reconnect-miner"
+        ) as executor:
+            starts = list(executor.map(exercise_miner, range(miners)))
+    else:
+        starts = [exercise_miner(miner_index) for miner_index in range(miners)]
 
     deadline = time.monotonic() + max(TIMEOUT_SECONDS, 15)
-    delivered: set[str] = set()
+    counts: dict[str, int] = {}
     while time.monotonic() < deadline:
-        delivered = accepted_submit_nonces() - before
-        if expected <= delivered:
+        counts = accepted_submit_counts()
+        if expected <= counts.keys():
             break
         time.sleep(0.1)
 
-    missing = sorted(expected - delivered)
+    missing = sorted(expected - counts.keys())
+    duplicates = sorted(nonce for nonce in expected if counts.get(nonce, 0) > 1)
     result = {
         "scenario": scenario,
         "transport": "tls" if USE_TLS else "plain",
         "miners": miners,
         "submits_sent": len(expected),
-        "submits_delivered": len(expected & delivered),
+        "submits_delivered": len(expected & counts.keys()),
         "submits_lost": len(missing),
+        "submits_duplicated": len(duplicates),
+        "simultaneous_connect": simultaneous,
+        "connection_start_spread_seconds": max(starts) - min(starts),
         "lost_examples": missing[:5],
-        "passed": not missing,
+        "passed": not missing and not duplicates,
     }
     print(json.dumps(result, separators=(",", ":"), sort_keys=True), flush=True)
-    return not missing
+    return not missing and not duplicates
 
 
 def main() -> int:
@@ -1482,7 +1589,7 @@ def main() -> int:
         raise SystemExit(
             "usage: tester.py expect-primary|expect-secondary|invalid-rejected|"
             "oversized-rejected|certificate-fingerprint|persistent-tls-session|"
-            "benchmark|share-integrity|load-N"
+            "persistent-routing-session|benchmark|share-integrity|load-N"
         )
     command = sys.argv[1]
     if command == "expect-primary":
@@ -1497,10 +1604,12 @@ def main() -> int:
         certificate_fingerprint()
     elif command == "persistent-tls-session":
         persistent_tls_session()
+    elif command == "persistent-routing-session":
+        persistent_routing_session()
     elif command == "benchmark":
         try:
             return 0 if qualification_benchmark() else 1
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 -- Always retain a structured failure artifact.
             failure = {
                 "schema_version": 1,
                 "scenario": os.environ.get("BENCH_SCENARIO", "unknown"),

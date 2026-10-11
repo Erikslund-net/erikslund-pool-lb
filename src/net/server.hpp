@@ -22,6 +22,8 @@ public:
     // whether losing a worker should stop the process.
     void start(const std::function<void()>& on_worker_failure = {});
     void stop();
+    void reload(std::shared_ptr<const core::Config> config,
+                std::shared_ptr<const routing::RoutingTable> routing);
     void reload_tls(const core::Config& config);
 
 private:

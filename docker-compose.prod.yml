@@ -25,6 +25,6 @@ services:
         soft: 1048576
         hard: 1048576
     volumes:
-      - /opt/erikslund-pool-lb/etc/pool-lb.yml:/etc/erikslund-pool-lb/pool-lb.yml:ro
-      - /opt/erikslund-pool-lb/etc/tls:/etc/erikslund-pool-lb/tls:ro
+      # A directory mount follows atomic config/certificate replacements during reload.
+      - /opt/erikslund-pool-lb/etc:/etc/erikslund-pool-lb:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro

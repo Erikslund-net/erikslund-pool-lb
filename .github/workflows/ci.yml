@@ -101,25 +101,59 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: bash scripts/stress.sh
 
+  resilience:
+    if: >-
+      github.event_name != 'schedule' &&
+      (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Verify impairment recovery and simultaneous plain/TLS reconnects
+        env:
+          E2E_RESULT_DIR: resilience-results
+        run: |
+          mkdir -p resilience-results
+          set -o pipefail
+          bash scripts/e2e-resilience.sh 2>&1 | tee resilience-results/resilience.log
+      - name: Retain resilience evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pool-lb-resilience
+          path: resilience-results
+          if-no-files-found: warn
+          retention-days: 14
+
   scheduled-soak:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        tls: ["0", "1"]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Hold 5,000 valid proxied sessions
+      - name: Sustain 5,000 proxied sessions with submits for ten minutes
         env:
-          STRESS_CONNECTIONS: "5000"
-          STRESS_RESULT_DIR: soak-results
+          BENCH_SCENARIO: relay
+          BENCH_CONNECTIONS: "5000"
+          BENCH_DURATION_SECONDS: "600"
+          BENCH_RATE_PER_SECOND: "1000"
+          # Bound setup demand on the shared runner; measure sustained relay here.
+          BENCH_RAMP_PER_SECOND: "100"
+          BENCH_TLS: ${{ matrix.tls }}
+          BENCH_RESULT_DIR: soak-results
         run: |
           mkdir -p soak-results
           set -o pipefail
-          bash scripts/stress.sh 2>&1 | tee soak-results/stress.log
-      - name: Upload correctness-soak evidence
+          bash scripts/benchmark.sh 2>&1 | tee soak-results/soak.log
+      - name: Upload sustained-soak evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: pool-lb-5000-session-correctness-soak
+          name: pool-lb-5000-session-soak-tls-${{ matrix.tls }}
           path: soak-results
           if-no-files-found: warn
           retention-days: 14

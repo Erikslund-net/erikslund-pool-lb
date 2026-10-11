@@ -279,3 +279,60 @@ TEST_CASE("established TLS session survives abrupt peer failure and context rota
     persistent.socket.reset();
     edge.stop();
 }
+
+TEST_CASE("reload validates every TLS listener before publishing credentials limits or routes") {
+    TemporaryTlsCredentials original_credentials(1);
+    TemporaryTlsCredentials replacement_credentials(2);
+    const auto first_port = erikslund::test::unused_loopback_port();
+    const auto second_port = erikslund::test::unused_loopback_port();
+    auto original = tls_config(first_port, 3333, original_credentials);
+    original.listeners.push_back(original.listeners.front());
+    original.listeners.back().name = "second-tls";
+    original.listeners.back().address = "127.0.0.1:" + std::to_string(second_port);
+    const auto config = std::make_shared<const erikslund::core::Config>(original);
+    erikslund::core::ServiceState state;
+    const auto routes = erikslund::routing::make_routing_table(*config);
+    state.publish(config, routes);
+    const auto prior_runtime = state.runtime.load();
+    erikslund::net::EdgeServer edge(*config, state);
+    edge.start();
+    const auto prior_certificates = state.tls_certificates.load();
+
+    erikslund::net::SslContext client_context(
+        SSL_CTX_new(TLS_client_method()), erikslund::net::SslContextDeleter{});
+    REQUIRE(client_context);
+    SSL_CTX_set_verify(client_context.get(), SSL_VERIFY_NONE, nullptr);
+    const auto peer_serial = [&client_context](std::uint16_t port) {
+        auto client = connect_tls(port, *client_context);
+        std::unique_ptr<X509, decltype(&::X509_free)> certificate(
+            SSL_get1_peer_certificate(client.stream.get()), ::X509_free);
+        REQUIRE(certificate);
+        return ASN1_INTEGER_get(X509_get_serialNumber(certificate.get()));
+    };
+    auto replacement = original;
+    for (auto& listener : replacement.listeners) {
+        listener.certificate_file = replacement_credentials.certificate_file();
+        listener.private_key_file = replacement_credentials.private_key_file();
+    }
+    replacement.limits.max_queued_bytes /= 2;
+    replacement.limits.byte_burst_per_ip = 1;
+    replacement.listeners.back().private_key_file = original_credentials.private_key_file();
+    CHECK_THROWS(edge.reload(std::make_shared<const erikslund::core::Config>(replacement), routes));
+    CHECK(state.runtime.load() == prior_runtime);
+    CHECK(state.tls_certificates.load() == prior_certificates);
+    CHECK(state.stats.queued_bytes_limit.load() == original.limits.max_queued_bytes);
+    CHECK(state.stats.tls_reload_failures.load() == 1);
+    CHECK(state.stats.tls_reload_successes.load() == 0);
+    CHECK(peer_serial(first_port) == 1);
+    CHECK(peer_serial(second_port) == 1);
+
+    replacement.listeners.back().private_key_file = replacement_credentials.private_key_file();
+    const auto committed = std::make_shared<const erikslund::core::Config>(replacement);
+    edge.reload(committed, routes);
+    CHECK(state.runtime.load()->config == committed);
+    CHECK(state.stats.queued_bytes_limit.load() == replacement.limits.max_queued_bytes);
+    CHECK(state.stats.tls_reload_successes.load() == 1);
+    CHECK(peer_serial(first_port) == 2);
+    CHECK(peer_serial(second_port) == 2);
+    edge.stop();
+}

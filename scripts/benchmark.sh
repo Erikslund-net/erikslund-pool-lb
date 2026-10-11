@@ -8,12 +8,14 @@ SCENARIO="${BENCH_SCENARIO:-relay}"
 if [[ "$SCENARIO" == "stalled-client" || "$SCENARIO" == "stalled-upstream" ]]; then
   DEFAULT_CONNECTIONS=4
   DEFAULT_RAMP_PER_SECOND=50
+  DEFAULT_DURATION_SECONDS=5
 else
   DEFAULT_CONNECTIONS=1000
   DEFAULT_RAMP_PER_SECOND=500
+  DEFAULT_DURATION_SECONDS=30
 fi
 CONNECTIONS="${BENCH_CONNECTIONS:-$DEFAULT_CONNECTIONS}"
-DURATION_SECONDS="${BENCH_DURATION_SECONDS:-30}"
+DURATION_SECONDS="${BENCH_DURATION_SECONDS:-$DEFAULT_DURATION_SECONDS}"
 RAMP_PER_SECOND="${BENCH_RAMP_PER_SECOND:-$DEFAULT_RAMP_PER_SECOND}"
 RATE_PER_SECOND="${BENCH_RATE_PER_SECOND:-1000}"
 TLS="${BENCH_TLS:-0}"
@@ -27,6 +29,10 @@ GENERATOR_ID="${BENCH_GENERATOR_ID:-generator-1}"
 STALLED_BYTES_PER_SESSION="${BENCH_STALLED_BYTES_PER_SESSION:-8388608}"
 RESPONSE_PADDING_BYTES="${BENCH_RESPONSE_PADDING_BYTES:-0}"
 QUEUE_LIMIT_BYTES="${BENCH_QUEUE_LIMIT_BYTES:-0}"
+MODE="${BENCH_MODE:-qualification}"
+IO_WORKERS="${BENCH_IO_WORKERS:-2}"
+container_id="${BENCH_TARGET_CONTAINER:-}"
+configuration_directory=""
 sampler_pid=""
 
 usage() {
@@ -41,11 +47,14 @@ Configuration is through environment variables:
   BENCH_RAMP_PER_SECOND          offered session establishment rate (default 500)
   BENCH_RATE_PER_SECOND          relay messages or churn operations per second (default 1000)
   BENCH_TLS                      0 for SV1, 1 for SV1/TLS (default 0)
+  BENCH_IO_WORKERS               managed LB reactor count (default 2; CPU quota unchanged)
+  BENCH_MODE                     qualification (default) | smoke (functional exit status only)
   BENCH_RESULT_DIR               artifact directory (default benchmark-results/<UTC>)
   BENCH_MANAGE_STACK             1 for the hermetic stack, 0 for an external target
   BENCH_TARGET_HOST              external target visible inside the tester container
   BENCH_TARGET_PORT              external target port
   BENCH_TARGET_API_URL           external Prometheus URL visible inside the tester container
+  BENCH_TARGET_CONTAINER         external LB container on the current Docker daemon, for evidence
   BENCH_DOCKER_NETWORK           external tester Docker network (default host)
   BENCH_BACKEND_TUPLES           distinct upstream destination IP:port pairs for preflight
   BENCH_UPSTREAM_SOURCE_ADDRESSES distinct load-balancer source IPs for preflight
@@ -54,10 +63,14 @@ Configuration is through environment variables:
   BENCH_STALLED_BYTES_PER_SESSION bounded bytes offered toward each stalled direction
   BENCH_RESPONSE_PADDING_BYTES    controlled-backend response padding for external stalled-client
   BENCH_QUEUE_LIMIT_BYTES        expected process queue cap (required for external stalled tests)
+  BENCH_BACKEND_CONTROL_URL      controlled backend POST /pause and /resume URL prefix
+  E2E_POOL_SUBMIT_COUNTS_URL      controlled backend exact per-nonce counts URL
 
 The managed hermetic stack is deliberately capped at 20,000 sessions and is not 100k evidence.
 Use independently addressed generator namespaces or hosts and enough upstream four-tuples for
 deployment qualification; keep one result JSON per generator.
+Qualification exits 1 for known failures and 3 for unavailable evidence. External targets without
+BENCH_TARGET_CONTAINER are inconclusive; smoke mode never claims resource qualification.
 EOF
 }
 
@@ -93,6 +106,37 @@ cleanup() {
   if [[ "$MANAGE_STACK" == "1" ]]; then
     "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
   fi
+  if [[ -n "$configuration_directory" ]]; then
+    rm -f "$configuration_directory/pool-lb.yml"
+    rmdir "$configuration_directory"
+  fi
+}
+
+collect_target_resources() {
+  local phase="$1"
+  local status=3
+  if [[ -n "$container_id" ]]; then
+    # The native reader works within production seccomp; interpretation runs outside the daemon.
+    if docker exec "$container_id" erikslund-pool-lb --capacity-snapshot \
+        >"$RESULT_DIR/$phase.raw.json" 2>"$RESULT_DIR/$phase.log"; then
+      run_evaluator --snapshot "/results/$phase.raw.json" "$CONNECTIONS" \
+        "$BACKEND_TUPLES" "$UPSTREAM_SOURCE_ADDRESSES" "$GENERATOR_SOURCES" \
+        >"$RESULT_DIR/$phase.json" 2>>"$RESULT_DIR/$phase.log" && status=0 || status=$?
+    else
+      printf '{}\n' >"$RESULT_DIR/$phase.json"
+    fi
+  else
+    printf '{}\n' >"$RESULT_DIR/$phase.json"
+    printf 'No target container supplied; resource evidence unavailable.\n' >"$RESULT_DIR/$phase.log"
+  fi
+  echo "$status" >"$RESULT_DIR/$phase.exit-code"
+}
+
+run_evaluator() {
+  MSYS_NO_PATHCONV=1 docker run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --pids-limit 32 --memory 128m --cpus 1 \
+    -v "$docker_result_dir:/results:ro" --entrypoint python3 \
+    erikslund-pool-lb-tester /usr/local/bin/qualification.py "$@"
 }
 
 collect_managed_logs() {
@@ -144,6 +188,11 @@ if [[ "$MANAGE_STACK" == "0" && -z "${BENCH_TARGET_HOST:-}" ]]; then
   exit 2
 fi
 require_positive_integer BENCH_CONNECTIONS "$CONNECTIONS"
+require_positive_integer BENCH_IO_WORKERS "$IO_WORKERS"
+if [[ "$IO_WORKERS" -gt 256 || ! "$MODE" =~ ^(qualification|smoke)$ ]]; then
+  echo "BENCH_IO_WORKERS must be at most 256; BENCH_MODE must be qualification or smoke" >&2
+  exit 2
+fi
 require_positive_number BENCH_DURATION_SECONDS "$DURATION_SECONDS"
 require_positive_number BENCH_RAMP_PER_SECOND "$RAMP_PER_SECOND"
 require_positive_number BENCH_RATE_PER_SECOND "$RATE_PER_SECOND"
@@ -159,6 +208,14 @@ fi
 
 mkdir -p "$RESULT_DIR"
 RESULT_DIR=$(cd "$RESULT_DIR" && pwd -P)
+docker_result_dir="$RESULT_DIR"
+if command -v cygpath >/dev/null 2>&1; then
+  docker_result_dir=$(cygpath -m "$RESULT_DIR")
+fi
+if [[ -e "$RESULT_DIR/environment.txt" ]]; then
+  echo "Use a fresh BENCH_RESULT_DIR; mixing evidence from different runs is unsafe." >&2
+  exit 2
+fi
 trap cleanup EXIT
 
 target_host="${BENCH_TARGET_HOST:-pool-lb}"
@@ -182,11 +239,16 @@ if [[ "$SCENARIO" == "stalled-client" || "$SCENARIO" == "stalled-upstream" ]]; t
       RESPONSE_PADDING_BYTES=16384
     else
       export E2E_RESPONSE_PADDING_BYTES=0
-      export E2E_STALL_AFTER_REQUESTS=2
+      export E2E_STALL_AFTER_REQUESTS=0
       RESPONSE_PADDING_BYTES=0
     fi
   else
     require_positive_integer BENCH_QUEUE_LIMIT_BYTES "$QUEUE_LIMIT_BYTES"
+    if [[ -z "${E2E_POOL_SUBMIT_COUNTS_URL:-}" ||
+          ("$SCENARIO" == "stalled-upstream" && -z "${BENCH_BACKEND_CONTROL_URL:-}") ]]; then
+      echo "External stalled tests require a submit-counts endpoint and upstream pause/resume control." >&2
+      exit 2
+    fi
     if [[ -z "$target_api_url" ]]; then
       echo "BENCH_TARGET_API_URL is required for external stalled-peer scenarios" >&2
       exit 2
@@ -211,6 +273,8 @@ fi
   echo "rate_per_second=$RATE_PER_SECOND"
   echo "tls=$TLS"
   echo "managed_stack=$MANAGE_STACK"
+  echo "mode=$MODE"
+  echo "io_workers=$IO_WORKERS"
   echo "generator_id=$GENERATOR_ID"
   echo "connect_workers=${BENCH_CONNECT_WORKERS:-16}"
   echo "stalled_bytes_per_session=$STALLED_BYTES_PER_SESSION"
@@ -221,11 +285,18 @@ fi
 } >"$RESULT_DIR/environment.txt" 2>&1
 
 if [[ "$MANAGE_STACK" == "1" ]]; then
+  configuration_directory=$(mktemp -d tests/e2e/config.XXXXXX)
+  sed "s/^io_workers:.*/io_workers: $IO_WORKERS/" \
+    "tests/e2e/${E2E_POOL_LB_CONFIG#./}" >"$configuration_directory/pool-lb.yml"
+  chmod 755 "$configuration_directory"
+  chmod 644 "$configuration_directory/pool-lb.yml"
+  export E2E_CONFIG_DIRECTORY="./${configuration_directory##*/}"
+  export E2E_POOL_LB_CONFIG=pool-lb.yml
   echo "==> Starting the hermetic release stack"
   "${COMPOSE[@]}" build tester
   "${COMPOSE[@]}" up -d --build certs pool-primary pool-secondary pool-lb
   "${COMPOSE[@]}" config >"$RESULT_DIR/compose.yml"
-  cp "tests/e2e/${E2E_POOL_LB_CONFIG#./}" "$RESULT_DIR/pool-lb.yml"
+  cp "$configuration_directory/pool-lb.yml" "$RESULT_DIR/pool-lb.yml"
 
   ready=false
   for _ in {1..120}; do
@@ -250,23 +321,7 @@ if [[ "$MANAGE_STACK" == "1" ]]; then
   curl -fsS --max-time 5 http://127.0.0.1:17778/metrics \
     >"$RESULT_DIR/metrics-before.prom" || true
 
-  preflight_pid_args=()
   container_id=$("${COMPOSE[@]}" ps -q pool-lb)
-  if [[ -n "$container_id" ]]; then
-    candidate_pid=$(docker inspect --format '{{.State.Pid}}' "$container_id" 2>/dev/null || true)
-    if [[ -n "$candidate_pid" && -r "/proc/$candidate_pid/limits" ]]; then
-      preflight_pid_args=(--pid "$candidate_pid")
-    fi
-  fi
-  set +e
-  bash scripts/capacity-preflight.sh --max-connections "$CONNECTIONS" \
-    --backend-tuples "$BACKEND_TUPLES" \
-    --upstream-source-addresses "$UPSTREAM_SOURCE_ADDRESSES" \
-    --generator-sources "$GENERATOR_SOURCES" "${preflight_pid_args[@]}" \
-    >"$RESULT_DIR/preflight.json" 2>"$RESULT_DIR/preflight.log"
-  preflight_status=$?
-  set -e
-  echo "$preflight_status" >"$RESULT_DIR/preflight.exit-code"
 
   sample_managed_resources >"$RESULT_DIR/resources.tsv" 2>&1 &
   sampler_pid=$!
@@ -274,6 +329,7 @@ else
   echo "==> Building the dependency-free generator for external target $target_host:$target_port"
   docker build -f tests/e2e/Dockerfile.tester -t erikslund-pool-lb-tester .
 fi
+collect_target_resources preflight
 
 tester_environment=(
   -e "LB_HOST=$target_host"
@@ -296,6 +352,8 @@ tester_environment=(
   -e "BENCH_STALLED_BYTES_PER_SESSION=$STALLED_BYTES_PER_SESSION"
   -e "BENCH_RESPONSE_PADDING_BYTES=$RESPONSE_PADDING_BYTES"
   -e "BENCH_QUEUE_LIMIT_BYTES=$QUEUE_LIMIT_BYTES"
+  -e "BENCH_BACKEND_CONTROL_URL=${BENCH_BACKEND_CONTROL_URL:-http://pool-primary:7777/control}"
+  -e "E2E_POOL_SUBMIT_COUNTS_URL=${E2E_POOL_SUBMIT_COUNTS_URL:-http://pool-primary:7777/submit-counts}"
 )
 
 echo "==> Running $SCENARIO qualification ($CONNECTIONS sessions, ${DURATION_SECONDS}s, TLS=$TLS)"
@@ -314,33 +372,38 @@ set -e
 stop_sampler
 
 if [[ -s "$RESULT_DIR/generator.stdout.log" ]]; then
-  tail -n 1 "$RESULT_DIR/generator.stdout.log" >"$RESULT_DIR/result.json"
+  tail -n 1 "$RESULT_DIR/generator.stdout.log" >"$RESULT_DIR/generator-result.json"
 else
   printf '{"schema_version":1,"passed":false,"fatal_error":"generator produced no result"}\n' \
-    >"$RESULT_DIR/result.json"
+    >"$RESULT_DIR/generator-result.json"
   benchmark_status=1
 fi
 
 if [[ "$MANAGE_STACK" == "1" ]]; then
   curl -fsS --max-time 5 http://127.0.0.1:17778/metrics \
     >"$RESULT_DIR/metrics-after.prom" || true
-  set +e
-  bash scripts/capacity-preflight.sh --max-connections "$CONNECTIONS" \
-    --backend-tuples "$BACKEND_TUPLES" \
-    --upstream-source-addresses "$UPSTREAM_SOURCE_ADDRESSES" \
-    --generator-sources "$GENERATOR_SOURCES" "${preflight_pid_args[@]}" \
-    >"$RESULT_DIR/postflight.json" 2>"$RESULT_DIR/postflight.log"
-  postflight_status=$?
-  set -e
-  echo "$postflight_status" >"$RESULT_DIR/postflight.exit-code"
   collect_managed_logs
 fi
+collect_target_resources postflight
 echo "$benchmark_status" >"$RESULT_DIR/benchmark.exit-code"
 
-if [[ "$benchmark_status" -ne 0 ]]; then
-  echo "==> QUALIFICATION FAILED; artifacts: $RESULT_DIR" >&2
-  tail -n 40 "$RESULT_DIR/generator.stderr.log" >&2 || true
+qualification_status=0
+run_evaluator /results \
+  >"$RESULT_DIR/result.json" || qualification_status=$?
+echo "$qualification_status" >"$RESULT_DIR/qualification.exit-code"
+if [[ "$MODE" == "smoke" ]]; then
+  echo "==> FUNCTIONAL SMOKE exit=$benchmark_status; not resource qualification"
+  echo "    artifacts: $RESULT_DIR"
   exit "$benchmark_status"
+fi
+if [[ "$qualification_status" -ne 0 ]]; then
+  if [[ "$qualification_status" -eq 3 ]]; then
+    echo "==> QUALIFICATION INCONCLUSIVE; resource evidence unavailable: $RESULT_DIR" >&2
+  else
+    echo "==> QUALIFICATION FAILED; artifacts: $RESULT_DIR" >&2
+  fi
+  tail -n 40 "$RESULT_DIR/generator.stderr.log" >&2 || true
+  exit "$qualification_status"
 fi
 echo "==> QUALIFICATION PASSED for this generator/topology only"
 echo "    artifacts: $RESULT_DIR"

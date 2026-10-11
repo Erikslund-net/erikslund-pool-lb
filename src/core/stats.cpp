@@ -4,8 +4,19 @@
 
 namespace erikslund::core {
 
+namespace {
+
+void update_maximum(std::atomic<std::uint64_t>& counter, std::uint64_t value) noexcept {
+    std::uint64_t maximum = counter.load(std::memory_order_relaxed);
+    while (maximum < value &&
+           !counter.compare_exchange_weak(maximum, value, std::memory_order_relaxed,
+                                           std::memory_order_relaxed)) {
+    }
+}
+
+} // namespace
+
 void WorkerStats::record_protocol_error(stratum::ValidationError error) noexcept {
-    rejected_protocol.fetch_add(1, std::memory_order_relaxed);
     const auto index = static_cast<std::size_t>(error);
     if (index < protocol_errors.size())
         protocol_errors[index].fetch_add(1, std::memory_order_relaxed);
@@ -18,12 +29,17 @@ void WorkerStats::record_event_batch(std::size_t events,
     events_processed.fetch_add(events, std::memory_order_relaxed);
     event_batches.fetch_add(1, std::memory_order_relaxed);
     batch_processing_nanoseconds.fetch_add(elapsed, std::memory_order_relaxed);
-    std::uint64_t maximum =
-        maximum_batch_processing_nanoseconds.load(std::memory_order_relaxed);
-    while (maximum < elapsed &&
-           !maximum_batch_processing_nanoseconds.compare_exchange_weak(
-               maximum, elapsed, std::memory_order_relaxed, std::memory_order_relaxed)) {
-    }
+    update_maximum(maximum_batch_processing_nanoseconds, elapsed);
+}
+
+void WorkerStats::record_timeout_batch(std::size_t timeouts,
+                                       std::chrono::nanoseconds processing_time) noexcept {
+    const auto elapsed = static_cast<std::uint64_t>(
+        std::max<std::chrono::nanoseconds::rep>(processing_time.count(), 0));
+    timeouts_processed.fetch_add(timeouts, std::memory_order_relaxed);
+    timeout_batches.fetch_add(1, std::memory_order_relaxed);
+    timeout_processing_nanoseconds.fetch_add(elapsed, std::memory_order_relaxed);
+    update_maximum(maximum_timeout_processing_nanoseconds, elapsed);
 }
 
 void Stats::initialize_workers(std::size_t count) {
@@ -64,6 +80,12 @@ StatsSnapshot Stats::snapshot() const noexcept {
         output.maximum_batch_processing_nanoseconds =
             std::max(output.maximum_batch_processing_nanoseconds,
                      load(worker_stats->maximum_batch_processing_nanoseconds));
+        output.timeouts_processed += load(worker_stats->timeouts_processed);
+        output.timeout_batches += load(worker_stats->timeout_batches);
+        output.timeout_processing_nanoseconds += load(worker_stats->timeout_processing_nanoseconds);
+        output.maximum_timeout_processing_nanoseconds =
+            std::max(output.maximum_timeout_processing_nanoseconds,
+                     load(worker_stats->maximum_timeout_processing_nanoseconds));
         output.tls_handshake_attempts += load(worker_stats->tls_handshake_attempts);
         output.tls_handshake_successes += load(worker_stats->tls_handshake_successes);
         output.tls_handshake_nanoseconds += load(worker_stats->tls_handshake_nanoseconds);

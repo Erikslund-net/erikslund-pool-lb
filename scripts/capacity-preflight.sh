@@ -260,6 +260,15 @@ else
 fi
 
 target_status_file="/proc/$TARGET_PID/status"
+target_start_ticks="null"
+if [[ -r "/proc/$TARGET_PID/stat" ]]; then
+  target_stat=$(read_value "/proc/$TARGET_PID/stat")
+  # The parenthesized comm field may contain spaces or parentheses.
+  target_start_ticks=$(awk '{ print $20 }' <<<"${target_stat##*) }")
+  target_start_ticks=${target_start_ticks:-null}
+fi
+boot_id=$(read_value /proc/sys/kernel/random/boot_id)
+boot_id=${boot_id:-unknown}
 target_vm_rss_kib="null"
 target_threads="null"
 target_voluntary_context_switches="null"
@@ -420,12 +429,12 @@ cpu_system_usec=0
 cpu_nr_periods=0
 cpu_nr_throttled=0
 cpu_throttled_usec=0
-memory_events_low=0
-memory_events_high=0
-memory_events_max=0
-memory_events_oom=0
-memory_events_oom_kill=0
-memory_events_oom_group_kill=0
+memory_events_low=null
+memory_events_high=null
+memory_events_max=null
+memory_events_oom=null
+memory_events_oom_kill=null
+memory_events_oom_group_kill=null
 if [[ -r "/proc/$TARGET_PID/cgroup" ]]; then
   cgroup_relative=$(awk -F: '$1 == "0" { print $3; exit }' "/proc/$TARGET_PID/cgroup")
   if [[ -n "$cgroup_relative" && -d "/sys/fs/cgroup$cgroup_relative" ]]; then
@@ -476,13 +485,13 @@ if [[ -r "/proc/$TARGET_PID/cgroup" ]]; then
       memory_events_oom_group_kill=$(
         awk '$1 == "oom_group_kill" { print $2 }' "$cgroup_root/memory.events"
       )
-      memory_events_low=${memory_events_low:-0}
-      memory_events_high=${memory_events_high:-0}
-      memory_events_max=${memory_events_max:-0}
-      memory_events_oom=${memory_events_oom:-0}
-      memory_events_oom_kill=${memory_events_oom_kill:-0}
-      memory_events_oom_group_kill=${memory_events_oom_group_kill:-0}
-      if [[ "$memory_events_oom_kill" -gt 0 ]]; then
+      memory_events_low=${memory_events_low:-null}
+      memory_events_high=${memory_events_high:-null}
+      memory_events_max=${memory_events_max:-null}
+      memory_events_oom=${memory_events_oom:-null}
+      memory_events_oom_kill=${memory_events_oom_kill:-null}
+      memory_events_oom_group_kill=${memory_events_oom_group_kill:-null}
+      if [[ "$memory_events_oom_kill" != "null" && "$memory_events_oom_kill" -gt 0 ]]; then
         warnings+=("target cgroup reports prior OOM kills; compare counters before and after a run")
       fi
     fi
@@ -502,7 +511,12 @@ cat <<EOF
 {
   "schema_version": 1,
   "passed": $passed,
-  "target": {"pid": $TARGET_PID, "max_connections": $MAX_CONNECTIONS},
+  "target": {
+    "pid": $TARGET_PID,
+    "start_ticks": $target_start_ticks,
+    "boot_id": "$(json_escape "$boot_id")",
+    "max_connections": $MAX_CONNECTIONS
+  },
   "process": {
     "open_file_descriptors": $target_fd_count,
     "vm_rss_kib": $target_vm_rss_kib,

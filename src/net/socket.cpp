@@ -70,12 +70,11 @@ ConnectStart start_connect(const SocketAddress& address,
         if (source_address->family != address.family)
             return {};
 #ifdef IP_BIND_ADDRESS_NO_PORT
-        if (address.family == AF_INET) {
-            const int enabled = 1;
-            // Best effort: older kernels may not support deferred ephemeral-port allocation.
-            ::setsockopt(socket.get(), IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, &enabled,
-                         sizeof(enabled));
-        }
+        const int enabled = 1;
+        // Linux uses this IP-level option for both families, allowing source-port reuse across
+        // destinations. Best effort for older kernels without deferred port allocation.
+        ::setsockopt(socket.get(), IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, &enabled,
+                     sizeof(enabled));
 #endif
         if (::bind(socket.get(), reinterpret_cast<const sockaddr*>(&source_address->value),
                    source_address->length) < 0)

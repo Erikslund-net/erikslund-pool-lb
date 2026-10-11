@@ -92,6 +92,8 @@ std::size_t worker_count(const core::Config& config) {
 } // namespace
 
 struct EdgeServer::Runtime {
+    explicit Runtime(const core::LimitsConfig& limits) : rate_limiter(limits) {}
+
     std::vector<ReactorListener> listener_templates;
     RateLimiter rate_limiter;
     TlsContextStore tls_contexts;
@@ -99,7 +101,7 @@ struct EdgeServer::Runtime {
 };
 
 EdgeServer::EdgeServer(const core::Config& config, core::ServiceState& state)
-    : state_(state), runtime_(std::make_unique<Runtime>()) {
+    : state_(state), runtime_(std::make_unique<Runtime>(config.limits)) {
     for (const core::ListenerConfig& listener_config : config.listeners) {
         const auto addresses = resolve_endpoints(parse_endpoint(listener_config.address), true);
         ReactorListener listener{
@@ -164,6 +166,31 @@ void EdgeServer::stop() {
     threads_.clear();
 }
 
+void EdgeServer::reload(std::shared_ptr<const core::Config> config,
+                         std::shared_ptr<const routing::RoutingTable> routing) {
+    const auto current = state_.runtime.load(std::memory_order_acquire);
+    if (!current->config->restart_required_changes(*config).empty())
+        throw core::ConfigError("configuration reload changes restart-only settings");
+    auto replacement = std::make_shared<const core::RuntimeSnapshot>(
+        core::RuntimeSnapshot{.config = std::move(config), .routing = std::move(routing)});
+    LoadedTlsContexts loaded;
+    try {
+        loaded = load_tls_contexts(*replacement->config);
+    } catch (...) {
+        state_.stats.tls_reload_failures.fetch_add(1, std::memory_order_relaxed);
+        throw;
+    }
+    // All allocations and credential validation precede mutation. The limiter acquires all
+    // shard locks before modifying any policy; the following publications cannot fail.
+    runtime_->rate_limiter.update_traffic_limits(replacement->config->limits);
+    runtime_->tls_contexts.replace(std::move(loaded.contexts));
+    state_.tls_certificates.store(std::move(loaded.certificates), std::memory_order_release);
+    state_.publish(std::move(replacement));
+    if (std::ranges::any_of(current->config->listeners,
+                            [](const auto& listener) { return listener.tls; }))
+        state_.stats.tls_reload_successes.fetch_add(1, std::memory_order_relaxed);
+}
+
 void EdgeServer::reload_tls(const core::Config& config) {
     const std::size_t tls_listener_count = static_cast<std::size_t>(
         std::ranges::count_if(config.listeners,
@@ -174,11 +201,10 @@ void EdgeServer::reload_tls(const core::Config& config) {
         LoadedTlsContexts replacement = load_tls_contexts(config);
         if (replacement.contexts.size() != runtime_->listener_templates.size())
             throw core::ConfigError("listener topology changed during TLS reload");
-        runtime_->tls_contexts.publish(std::move(replacement.contexts));
+        runtime_->tls_contexts.replace(std::move(replacement.contexts));
         state_.tls_certificates.store(std::move(replacement.certificates),
                                       std::memory_order_release);
         state_.stats.tls_reload_successes.fetch_add(1, std::memory_order_relaxed);
-        core::log::info("TLS credentials reloaded for {} listener(s)", tls_listener_count);
     } catch (...) {
         state_.stats.tls_reload_failures.fetch_add(1, std::memory_order_relaxed);
         throw;

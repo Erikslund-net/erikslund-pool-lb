@@ -5,6 +5,8 @@ cd "$(dirname "$0")/.."
 
 COMPOSE=(docker compose -f tests/e2e/docker-compose.yml)
 persistent_output=""
+configuration_directory=""
+configuration_filename="pool-lb.yml"
 tls_reload_wait_seconds=30
 
 cleanup() {
@@ -12,6 +14,11 @@ cleanup() {
     rm -f "$persistent_output"
   fi
   "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
+  if [[ -n "$configuration_directory" ]]; then
+    rm -f "$configuration_directory/$configuration_filename" \
+      "$configuration_directory/$configuration_filename.next"
+    rmdir "$configuration_directory"
+  fi
 }
 failure() {
   echo "E2E failed: $*" >&2
@@ -52,6 +59,12 @@ wait_for_tls_reload_increment() {
 }
 
 echo "==> Starting the real load balancer, TLS generator, and fake pools"
+configuration_directory=$(mktemp -d tests/e2e/config.XXXXXX)
+cp tests/e2e/pool-lb.yml "$configuration_directory/$configuration_filename"
+chmod 755 "$configuration_directory"
+chmod 644 "$configuration_directory/$configuration_filename"
+export E2E_CONFIG_DIRECTORY="./${configuration_directory##*/}"
+export E2E_POOL_LB_CONFIG="$configuration_filename"
 "${COMPOSE[@]}" build tester
 "${COMPOSE[@]}" up -d --build certs pool-primary pool-secondary pool-lb
 sleep 4
@@ -172,6 +185,43 @@ grep -q 'pool_lb_backend_up{pool="primary",backend="pool-primary"} 1' <<<"$metri
   || failure "primary health metric missing"
 grep -q 'pool_lb_backend_connection_attempts_total' <<<"$metrics" \
   || failure "backend attempt metric missing"
+
+echo "==> Atomic configuration replacement switches new sessions and retains old ones"
+"${COMPOSE[@]}" run --rm --no-deps tester persistent-routing-session \
+  >"$persistent_output" 2>&1 &
+persistent_routing_tester=$!
+session_ready=false
+for _ in {1..120}; do
+  if grep -q '^ok: persistent routing session established$' "$persistent_output"; then
+    session_ready=true
+    break
+  fi
+  if ! kill -0 "$persistent_routing_tester" 2>/dev/null; then
+    cat "$persistent_output" >&2
+    failure "persistent routing tester exited before establishing a session"
+  fi
+  sleep 0.25
+done
+[[ "$session_ready" == true ]] || failure "persistent routing session did not become active"
+sed 's/^active_pool: primary$/active_pool: secondary/' tests/e2e/pool-lb.yml \
+  >"$configuration_directory/$configuration_filename.next"
+chmod 644 "$configuration_directory/$configuration_filename.next"
+mv "$configuration_directory/$configuration_filename.next" \
+  "$configuration_directory/$configuration_filename"
+"${COMPOSE[@]}" kill --signal SIGHUP pool-lb >/dev/null
+if ! wait "$persistent_routing_tester"; then
+  cat "$persistent_output" >&2
+  failure "atomic routing reload"
+fi
+cat "$persistent_output"
+tester expect-secondary
+cp tests/e2e/pool-lb.yml "$configuration_directory/$configuration_filename.next"
+chmod 644 "$configuration_directory/$configuration_filename.next"
+mv "$configuration_directory/$configuration_filename.next" \
+  "$configuration_directory/$configuration_filename"
+"${COMPOSE[@]}" kill --signal SIGHUP pool-lb >/dev/null
+sleep 1
+tester expect-primary
 
 echo "==> Primary loss routes new sessions to the secondary pool"
 "${COMPOSE[@]}" stop pool-primary

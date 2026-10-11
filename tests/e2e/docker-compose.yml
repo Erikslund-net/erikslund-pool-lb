@@ -66,9 +66,9 @@ services:
         condition: service_started
       pool-secondary:
         condition: service_started
-    command: ["--config", "/etc/erikslund-pool-lb/pool-lb.yml"]
+    command: ["--config", "/etc/erikslund-pool-lb/${E2E_POOL_LB_CONFIG:-pool-lb.yml}"]
     volumes:
-      - ${E2E_POOL_LB_CONFIG:-./pool-lb.yml}:/etc/erikslund-pool-lb/pool-lb.yml:ro
+      - ${E2E_CONFIG_DIRECTORY:-.}:/etc/erikslund-pool-lb:ro
       - tls:/tls:ro
     ports:
       - "127.0.0.1:13333:3333/tcp"
@@ -90,6 +90,7 @@ services:
         hard: 65536
 
   tester:
+    image: erikslund-pool-lb-tester
     build:
       context: ../..
       dockerfile: tests/e2e/Dockerfile.tester
@@ -102,7 +103,8 @@ services:
     read_only: true
     tmpfs: ["/tmp"]
     security_opt: ["no-new-privileges:true"]
-    pids_limit: 32
+    # The bounded reconnect cohort starts up to 128 protocol-driving threads.
+    pids_limit: 160
     mem_limit: 256m
     cpus: 0.5
     ulimits:

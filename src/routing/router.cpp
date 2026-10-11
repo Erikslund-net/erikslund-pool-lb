@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <string_view>
+#include <utility>
 
 #include "core/errors.hpp"
 #include "core/logging.hpp"
@@ -26,9 +27,27 @@ std::shared_ptr<BackendState> carried_over_backend(
     return {};
 }
 
+std::shared_ptr<BackendMetrics> carried_over_metrics(
+    const std::shared_ptr<const RoutingTable>& previous, std::string_view backend_name,
+    std::string_view pool_name, std::uint64_t& next_generation) {
+    if (previous)
+        for (const BackendMetricEntry& entry : previous->backend_metrics)
+            if (auto metrics = entry.metrics.lock();
+                metrics && metrics->name == backend_name && metrics->pool == pool_name)
+                return metrics;
+    auto metrics = std::make_shared<BackendMetrics>();
+    metrics->name = backend_name;
+    metrics->pool = pool_name;
+    if (next_generation == std::numeric_limits<std::uint64_t>::max())
+        throw core::ConfigError("backend metric generation exhausted; restart required");
+    metrics->generation = next_generation++;
+    return metrics;
+}
+
 std::shared_ptr<BackendState> resolve_backend(const std::shared_ptr<BackendState>& carried_over,
                                               const core::BackendConfig& config,
-                                              std::string_view pool_name) {
+                                              std::string_view pool_name,
+                                              std::shared_ptr<BackendMetrics> metrics) {
     std::vector<net::SocketAddress> addresses;
     std::vector<net::SocketAddress> health_addresses;
     try {
@@ -55,6 +74,7 @@ std::shared_ptr<BackendState> resolve_backend(const std::shared_ptr<BackendState
     backend->configured_health_address = config.health_address;
     backend->health_socket_addresses = std::move(health_addresses);
     backend->send_proxy_v2 = config.send_proxy_v2;
+    backend->metrics = std::move(metrics);
     return backend;
 }
 
@@ -91,6 +111,8 @@ bool has_compatible_source(const std::vector<net::SocketAddress>& sources,
 std::shared_ptr<RoutingTable> make_routing_table(
     const core::Config& config, const std::shared_ptr<const RoutingTable>& previous) {
     auto table = std::make_shared<RoutingTable>();
+    if (previous)
+        table->next_backend_metrics_generation = previous->next_backend_metrics_generation;
     table->active_pool = config.active_pool;
     table->failover = config.failover;
     table->health = config.health;
@@ -102,19 +124,35 @@ std::shared_ptr<RoutingTable> make_routing_table(
         for (const core::BackendConfig& backend_config : pool_config.backends) {
             auto backend = resolve_backend(
                 carried_over_backend(previous, backend_config, pool_config.name), backend_config,
-                pool_config.name);
+                pool_config.name,
+                carried_over_metrics(previous, backend_config.name, pool_config.name,
+                                     table->next_backend_metrics_generation));
             if (!table->upstream_source_addresses.empty() &&
                 !has_compatible_source(table->upstream_source_addresses,
                                        backend->socket_addresses))
                 throw core::ConfigError("backend " + pool_config.name + "/" +
                                         backend_config.name +
                                         " has no family-compatible upstream source address");
+            table->backend_metrics.push_back({.metrics = backend->metrics,
+                                              .current_backend = backend});
             pool.backends.push_back(std::move(backend));
         }
         table->pools.push_back(std::move(pool));
         if (pool_config.name == config.active_pool)
             table->active_pool_index = table->pools.size() - 1;
     }
+    if (previous)
+        for (const BackendMetricEntry& entry : previous->backend_metrics) {
+            const auto metrics = entry.metrics.lock();
+            if (!metrics)
+                continue;
+            const bool retained = std::ranges::any_of(
+                table->backend_metrics, [&metrics](const BackendMetricEntry& current) {
+                    return current.metrics.lock() == metrics;
+                });
+            if (!retained)
+                table->backend_metrics.push_back({.metrics = metrics, .current_backend = {}});
+        }
     return table;
 }
 
