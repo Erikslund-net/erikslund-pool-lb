@@ -4,15 +4,9 @@ FROM gcc:16.2.0-trixie@sha256:b69972d6afe6d5f6c7f91ae30027caf8a50549ee25b6303107
 ARG GLAZE_TAG=v9.0.0
 ARG MIMALLOC_TAG=v3.5.3
 ARG ERIKSLUND_HTTP_EMBEDDED_TAG=0.1.2
-ARG CA_CERTIFICATES_VERSION=20250419
-ARG CMAKE_VERSION=3.31.6-2
-ARG GIT_VERSION=1:2.47.3-0+deb13u1
-ARG LIBSSL_DEV_VERSION=3.5.7-1~deb13u2
-ARG MAKE_VERSION=4.4.1-2
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates="${CA_CERTIFICATES_VERSION}" cmake="${CMAKE_VERSION}" \
-        git="${GIT_VERSION}" libssl-dev="${LIBSSL_DEV_VERSION}" make="${MAKE_VERSION}" \
+        ca-certificates cmake git libssl-dev make \
     && rm -rf /var/lib/apt/lists/*
 RUN git init /tmp/glaze \
     && git -C /tmp/glaze remote add origin https://github.com/stephenberry/glaze.git \

@@ -1,7 +1,6 @@
 FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
-ARG OPENSSL_VERSION=3.5.7-1~deb13u2
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends openssl="${OPENSSL_VERSION}" \
+RUN apt-get update && apt-get install -y --no-install-recommends openssl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 certs \
     && useradd --uid 1000 --gid certs --no-create-home --shell /usr/sbin/nologin certs \
