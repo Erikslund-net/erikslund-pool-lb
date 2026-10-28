@@ -1,8 +1,8 @@
 # GCC 16.2 development, test, and static-analysis toolchain.
 FROM gcc:16.2.0-trixie@sha256:b69972d6afe6d5f6c7f91ae30027caf8a50549ee25b63031071383d00941bf2f
 
-ARG GLAZE_TAG=v9.0.0
-ARG MIMALLOC_TAG=v3.5.3
+ARG GLAZE_TAG=v9.1.0
+ARG MIMALLOC_TAG=v3.6.0
 ARG ERIKSLUND_HTTP_EMBEDDED_TAG=0.1.2
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \

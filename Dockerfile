@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 FROM gcc:16.2.0-trixie@sha256:b69972d6afe6d5f6c7f91ae30027caf8a50549ee25b63031071383d00941bf2f AS builder
 
-ARG GLAZE_TAG=v9.0.0
-ARG MIMALLOC_TAG=v3.5.3
+ARG GLAZE_TAG=v9.1.0
+ARG MIMALLOC_TAG=v3.6.0
 ARG ERIKSLUND_HTTP_EMBEDDED_TAG=0.1.2
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
